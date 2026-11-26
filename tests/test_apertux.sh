@@ -538,11 +538,59 @@ test_liveness_smoke_status_and_pipe() {
   rm -rf "$sb"
 }
 
+test_logo_assets() {
+  local asset
+  for asset in assets/logo.svg assets/logo-light.svg assets/logo-dark.svg assets/icon.svg assets/icon.png; do
+    if [ -f "$ROOT_DIR/$asset" ]; then
+      pass "$asset exists"
+    else
+      fail "$asset exists" "missing $ROOT_DIR/$asset"
+    fi
+  done
+
+  if python3 - "$ROOT_DIR" <<'PY'
+import pathlib, struct, sys, xml.etree.ElementTree as ET
+root = pathlib.Path(sys.argv[1])
+ns = {"svg": "http://www.w3.org/2000/svg"}
+
+for name in ["logo.svg", "logo-light.svg", "logo-dark.svg", "icon.svg"]:
+    p = root / "assets" / name
+    if not p.is_file():
+        sys.exit(1)
+    text = p.read_text()
+    el = ET.fromstring(text)
+    assert el.attrib.get("role") == "img", f"{name} missing role=img"
+    title = el.find("svg:title", ns)
+    assert title is not None and title.text and "apertux" in title.text.lower(), f"{name} missing accessible <title>"
+
+for adaptive in ["logo.svg", "icon.svg"]:
+    text = (root / "assets" / adaptive).read_text()
+    assert "--apertux-ink" in text and "--apertux-accent" in text, f"{adaptive} missing CSS tokens"
+    assert "prefers-color-scheme: dark" in text, f"{adaptive} missing dark token swap"
+
+png = (root / "assets" / "icon.png").read_bytes()
+assert png[:8] == b"\x89PNG\r\n\x1a\n", "invalid PNG header"
+w, h = struct.unpack(">II", png[16:24])
+assert (w, h) == (512, 512), f"expected 512x512 icon.png, got {w}x{h}"
+PY
+  then
+    pass "SVG XML structure, a11y titles, CSS dark-mode tokens, and 512x512 PNG verified"
+  else
+    fail "SVG XML structure, a11y titles, CSS dark-mode tokens, and 512x512 PNG verified" "validation failed"
+  fi
+
+  local readme
+  readme="$(cat "$ROOT_DIR/README.md")"
+  assert_contains "$readme" "assets/logo-dark.svg" "README references dark logo variant"
+  assert_contains "$readme" "assets/logo-light.svg" "README references light logo variant"
+}
+
 test_help_and_defaults
 test_fabric_discovery_and_preflight
 test_local_only_bootstrap_gate
 test_cluster_orchestration_and_modes
 test_liveness_smoke_status_and_pipe
+test_logo_assets
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then

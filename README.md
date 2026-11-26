@@ -1,4 +1,10 @@
-# apertux
+<p align="left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
+    <img alt="apertux - Dual-Chevron Spark X wordmark" src="assets/logo-light.svg" width="460">
+  </picture>
+</p>
 
 Deploy Swiss-AI `Apertus-v1.5-70B` across two stacked NVIDIA DGX Sparks with a single `curl | bash` command and query it over an OpenAI-compatible HTTP endpoint.
 
