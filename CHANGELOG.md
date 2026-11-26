@@ -1,5 +1,9 @@
 # Changelog
 
+## [2026.11.26.1404] - 5b6ee64
+
+- Added `## References` section to `README.md` crediting Apertus (Swiss AI Initiative), Oleg Lavrovsky (`@loleg`), NVIDIA DGX Spark Playbooks, and vLLM, with automated assertions in `tests/test_apertux.sh`.
+
 ## [2026.11.26.1330] - 4f234db
 
 - Added Dual-Chevron Spark X brand assets derived from Swiss-AI's `apertvs.svg` geometry: adaptive CSS-token SVGs (`assets/logo.svg`, `assets/icon.svg`), explicit light/dark wordmarks (`assets/logo-light.svg`, `assets/logo-dark.svg`), and `512x512` repo icon (`assets/icon.png`).

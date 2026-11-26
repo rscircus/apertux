@@ -1,5 +1,9 @@
 # User Changelog
 
+## [2026.11.26.1404] - 5b6ee64
+
+- Added a References section to `README.md` linking Apertus, Oleg Lavrovsky (`@loleg`), NVIDIA DGX Spark Playbooks, and vLLM.
+
 ## [2026.11.26.1330] - 4f234db
 
 - Added the `apertux` Dual-Chevron Spark X wordmark and standalone icon (`assets/`) with automatic light/dark mode support in `README.md`.
