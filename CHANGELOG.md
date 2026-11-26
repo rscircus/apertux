@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026.11.27.1335] - aeaab22
+
+- Added `scripts/quantize_apertus.py` (plus embedded `curl | bash` fallback in `apertux.sh`) for 128 GB-safe offline `FP8_DYNAMIC` and `NVFP4` quantization via `llm-compressor` (`max_memory` + NVMe offload + built-in offline calibration corpus).
+- Added `--turbo` preset (`--quant nvfp4 --spec-mode draft --draft-model swiss-ai/Apertus-v1.1-1.5B-Instruct --spec-tokens 5 --dtype auto`), `--spec-mode ngram`, `quantize` subcommand with cross-Spark `tar`-over-SSH checkpoint sync, and `bench` subcommand reporting `tok/s`.
+- Extended local-only bootstrap gate to validate draft-model snapshots and `llmcompressor` wheelhouse before any network access.
+- Expanded automated test coverage to 2 Python unit tests + 133 Bash mock assertions.
+
 ## [2026.11.26.1404] - 5b6ee64
 
 - Added `## References` section to `README.md` crediting Apertus (Swiss AI Initiative), Oleg Lavrovsky (`@loleg`), NVIDIA DGX Spark Playbooks, and vLLM, with automated assertions in `tests/test_apertux.sh`.
