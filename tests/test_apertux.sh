@@ -351,8 +351,53 @@ test_fabric_discovery_and_preflight() {
   rm -rf "$sb"
 }
 
+test_local_only_bootstrap_gate() {
+  local sb out rc
+  sb="$(make_sandbox)"
+
+  # 1. Cached run never calls docker pull
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "${rc:-0}" "cached run succeeds without network pull"
+  assert_not_contains "$(cat "$sb/state/commands.log")" "docker pull" "cached run skips docker pull"
+
+  # 2. Missing image without --approve-download aborts before pulling
+  rm -f "$sb/state/commands.log" "$sb/state/image_pulled"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_MISSING_IMAGE=1 HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "missing image aborts without --approve-download"
+  else
+    fail "missing image aborts without --approve-download" "got exit 0"
+  fi
+  assert_contains "$out" "--approve-download" "missing artifact error explains --approve-download"
+  assert_not_contains "$(cat "$sb/state/commands.log")" "docker pull" "unapproved run never executes docker pull"
+
+  # 3. Missing worker weights without --approve-download aborts
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_WORKER_MISSING_WEIGHTS=1 HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "missing worker weights abort without --approve-download"
+  else
+    fail "missing worker weights abort without --approve-download" "got exit 0"
+  fi
+  assert_not_contains "$(cat "$sb/state/ssh_stdin.log")" "ROLE=bootstrap" "unapproved run never bootstraps worker"
+
+  # 4. With --approve-download, pulls missing image and bootstraps worker without leaking HF_TOKEN
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_MISSING_IMAGE=1 MOCK_WORKER_MISSING_WEIGHTS=1 HF_TOKEN="hf_secret_do_not_leak" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 --approve-download 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "approved bootstrap succeeds"
+  assert_contains "$(cat "$sb/state/commands.log")" "docker pull ghcr.io/swiss-ai/vllm_apertus_1.5_release:latest-arm64" "approved bootstrap pulls image"
+  assert_contains "$(cat "$sb/state/ssh_stdin.log")" "ROLE=bootstrap" "approved bootstrap downloads worker weights"
+  assert_not_contains "$out" "hf_secret_do_not_leak" "HF_TOKEN never leaked to output"
+
+  rm -rf "$sb"
+}
+
 test_help_and_defaults
 test_fabric_discovery_and_preflight
+test_local_only_bootstrap_gate
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then

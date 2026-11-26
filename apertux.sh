@@ -366,6 +366,148 @@ verify_fabric_ping() {
   ping -c 1 -W 2 "$WORKER_FABRIC_IP" >/dev/null 2>&1 || die "Cannot reach Spark 2 over 200GbE fabric ($HEAD_FABRIC_IP -> $WORKER_FABRIC_IP on $HEAD_FABRIC_IFACE)"
 }
 
+model_cache_subdir() {
+  local m="$1"
+  printf 'models--%s\n' "${m//\//--}"
+}
+
+has_local_weights() {
+  local model_id="$1"
+  local cache_dir="$2"
+  if [ -d "$model_id" ] && compgen -G "$model_id/*.safetensors" >/dev/null; then
+    return 0
+  fi
+  local sub
+  sub="$(model_cache_subdir "$model_id")"
+  if compgen -G "$cache_dir/hub/$sub/snapshots/*/*.safetensors" >/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+has_local_image() {
+  docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1
+}
+
+confirm_bootstrap_or_die() {
+  local reason="$1"
+  if [ "$APPROVE_DOWNLOAD" = "1" ]; then
+    return 0
+  fi
+  if [ "${APERTUX_DISABLE_TTY_PROMPT:-0}" != "1" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf 'Bootstrap required (%s).\nAuthorize first-time download to local cache? [y/N]: ' "$reason" >/dev/tty
+    local reply=""
+    read -r reply </dev/tty || true
+    case "$reply" in
+      y|Y|yes|YES)
+        APPROVE_DOWNLOAD=1
+        return 0
+        ;;
+    esac
+  fi
+  die "Missing local artifacts ($reason). Local-only rule blocks unapproved downloads; pass --approve-download to authorize first-time cache population."
+}
+
+download_local_weights() {
+  mkdir -p "$HF_CACHE_DIR"
+  local token_args=()
+  if [ -n "${HF_TOKEN:-}" ]; then
+    token_args=(-e HF_TOKEN)
+  fi
+  docker run --rm \
+    -e HF_HUB_DISABLE_TELEMETRY=1 \
+    -e DO_NOT_TRACK=1 \
+    "${token_args[@]}" \
+    -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
+    "$VLLM_IMAGE" \
+    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$MODEL')"
+}
+
+ensure_artifacts_ready() {
+  if [ "$DRY_RUN" = "1" ]; then
+    return 0
+  fi
+
+  local head_img_ok=0 head_wt_ok=0 worker_img_ok=1 worker_wt_ok=1
+  has_local_image && head_img_ok=1 || true
+  has_local_weights "$MODEL" "$HF_CACHE_DIR" && head_wt_ok=1 || true
+
+  local remote_cache_dir=""
+  if [ "$ROLE_MODE" = "cluster" ]; then
+    # Default remote HF cache uses Spark 2's $HOME/.cache/huggingface unless HF_CACHE_DIR was explicitly overridden to a shared path
+    local out
+    out="$(ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=check_cache
+img="$1"
+mdl="$2"
+cdir="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+img_ok=0
+wt_ok=0
+docker image inspect "$img" >/dev/null 2>&1 && img_ok=1 || true
+sub="models--${mdl//\//--}"
+if [ -d "$mdl" ] && compgen -G "$mdl/*.safetensors" >/dev/null; then
+  wt_ok=1
+elif compgen -G "$cdir/hub/$sub/snapshots/*/*.safetensors" >/dev/null; then
+  wt_ok=1
+fi
+printf 'IMAGE_OK=%s\nWEIGHTS_OK=%s\n' "$img_ok" "$wt_ok"
+REMOTE_EOF
+)"
+    worker_img_ok="$(printf '%s\n' "$out" | awk -F= '/^IMAGE_OK=/ { print $2; exit }')"
+    worker_wt_ok="$(printf '%s\n' "$out" | awk -F= '/^WEIGHTS_OK=/ { print $2; exit }')"
+  fi
+
+  local missing=()
+  [ "$head_img_ok" = "1" ] || missing+=("Spark1:image:$VLLM_IMAGE")
+  [ "$head_wt_ok" = "1" ] || missing+=("Spark1:weights:$MODEL")
+  [ "$worker_img_ok" = "1" ] || missing+=("Spark2:image:$VLLM_IMAGE")
+  [ "$worker_wt_ok" = "1" ] || missing+=("Spark2:weights:$MODEL")
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  confirm_bootstrap_or_die "${missing[*]}"
+
+  if [ "$head_img_ok" != "1" ]; then
+    docker pull "$VLLM_IMAGE"
+  fi
+  if [ "$head_wt_ok" != "1" ]; then
+    download_local_weights
+  fi
+
+  if [ "$ROLE_MODE" = "cluster" ] && { [ "$worker_img_ok" != "1" ] || [ "$worker_wt_ok" != "1" ]; }; then
+    ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" "$worker_img_ok" "$worker_wt_ok" <<REMOTE_EOF
+set -euo pipefail
+# ROLE=bootstrap
+img="\$1"
+mdl="\$2"
+img_ok="\$3"
+wt_ok="\$4"
+cdir="\${HF_CACHE_DIR:-\$HOME/.cache/huggingface}"
+mkdir -p "\$cdir"
+if [ "\$img_ok" != "1" ]; then
+  docker pull "\$img"
+fi
+if [ "\$wt_ok" != "1" ]; then
+  export HF_TOKEN="${HF_TOKEN:-}"
+  token_flag=()
+  if [ -n "\$HF_TOKEN" ]; then
+    token_flag=(-e HF_TOKEN)
+  fi
+  docker run --rm \
+    -e HF_HUB_DISABLE_TELEMETRY=1 \
+    -e DO_NOT_TRACK=1 \
+    "\${token_flag[@]}" \
+    -v "\$cdir:/root/.cache/huggingface" \
+    "\$img" \
+    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('\$mdl')"
+fi
+REMOTE_EOF
+  fi
+}
+
 print_config() {
   cat <<EOF
 ACTION=$ACTION
@@ -398,6 +540,7 @@ main() {
       detect_remote_fabric
       verify_fabric_ping
     fi
+    ensure_artifacts_ready
   fi
   if [ "$DRY_RUN" = "1" ]; then
     print_config
