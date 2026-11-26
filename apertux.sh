@@ -25,6 +25,16 @@ API_PORT="${API_PORT:-8000}"
 RAY_PORT="${RAY_PORT:-6379}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
 NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+QUANT_SCHEME="${QUANT_SCHEME:-none}"
+QUANT_BASE_DIR="${QUANT_BASE_DIR:-$HOME/.cache/apertux/quantized}"
+CALIB_FILE="${CALIB_FILE:-}"
+CALIB_SAMPLES="${CALIB_SAMPLES:-128}"
+FORCE_QUANT="${FORCE_QUANT:-0}"
+SPEC_MODE="${SPEC_MODE:-off}"
+DRAFT_MODEL="${DRAFT_MODEL:-swiss-ai/Apertus-v1.1-1.5B-Instruct}"
+SPEC_TOKENS="${SPEC_TOKENS:-5}"
+PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-4}"
+BENCH_MAX_TOKENS="${BENCH_MAX_TOKENS:-256}"
 APPROVE_DOWNLOAD="${APPROVE_DOWNLOAD:-0}"
 ALLOW_ARCH_MISMATCH="${ALLOW_ARCH_MISMATCH:-0}"
 DRY_RUN=0
@@ -38,6 +48,8 @@ WORKER_FABRIC_IP=""
 DOCKER_ENV_ARGS=()
 MODEL_MOUNT_ARGS=()
 CONTAINER_MODEL_REF=""
+CONTAINER_DRAFT_REF=""
+VLLM_SERVE_ARGS=()
 VLLM_SERVE_CMD=""
 
 SPARK_CX7_IFACES="enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1"
@@ -96,9 +108,10 @@ die() {
 }
 
 parse_args() {
+  local quant_explicit=0 spec_explicit=0
   if [ "$#" -gt 0 ]; then
     case "$1" in
-      up|down|status|smoke|logs)
+      up|down|status|smoke|logs|quantize|bench)
         ACTION="$1"
         shift
         ;;
@@ -173,6 +186,62 @@ parse_args() {
         SERVE_MODE="$2"
         shift 2
         ;;
+      --turbo)
+        [ "$quant_explicit" = "1" ] || QUANT_SCHEME="nvfp4"
+        [ "$spec_explicit" = "1" ] || SPEC_MODE="draft"
+        shift
+        ;;
+      --quant)
+        [ "$#" -ge 2 ] || die "--quant requires a value"
+        QUANT_SCHEME="$2"
+        quant_explicit=1
+        shift 2
+        ;;
+      --quant-dir)
+        [ "$#" -ge 2 ] || die "--quant-dir requires a value"
+        QUANT_BASE_DIR="$2"
+        shift 2
+        ;;
+      --calib-file)
+        [ "$#" -ge 2 ] || die "--calib-file requires a value"
+        CALIB_FILE="$2"
+        shift 2
+        ;;
+      --calib-samples)
+        [ "$#" -ge 2 ] || die "--calib-samples requires a value"
+        CALIB_SAMPLES="$2"
+        shift 2
+        ;;
+      --force-quant)
+        FORCE_QUANT=1
+        shift
+        ;;
+      --spec-mode)
+        [ "$#" -ge 2 ] || die "--spec-mode requires a value"
+        SPEC_MODE="$2"
+        spec_explicit=1
+        shift 2
+        ;;
+      --draft-model)
+        [ "$#" -ge 2 ] || die "--draft-model requires a value"
+        DRAFT_MODEL="$2"
+        shift 2
+        ;;
+      --spec-tokens)
+        [ "$#" -ge 2 ] || die "--spec-tokens requires a value"
+        SPEC_TOKENS="$2"
+        shift 2
+        ;;
+      --prompt-lookup-max)
+        [ "$#" -ge 2 ] || die "--prompt-lookup-max requires a value"
+        PROMPT_LOOKUP_MAX="$2"
+        shift 2
+        ;;
+      --max-tokens)
+        [ "$#" -ge 2 ] || die "--max-tokens requires a value"
+        BENCH_MAX_TOKENS="$2"
+        shift 2
+        ;;
       --port)
         [ "$#" -ge 2 ] || die "--port requires a value"
         API_PORT="$2"
@@ -226,6 +295,16 @@ parse_args() {
   case "$KV_CACHE_DTYPE" in
     fp8|fp8_e4m3|fp8_e5m2|auto) ;;
     *) die "Invalid --kv-cache-dtype '$KV_CACHE_DTYPE' (expected: fp8, auto)" ;;
+  esac
+
+  case "$QUANT_SCHEME" in
+    none|fp8|nvfp4) ;;
+    *) die "Invalid --quant '$QUANT_SCHEME' (expected: none, fp8, nvfp4)" ;;
+  esac
+
+  case "$SPEC_MODE" in
+    off|draft|ngram) ;;
+    *) die "Invalid --spec-mode '$SPEC_MODE' (expected: off, draft, ngram)" ;;
   esac
 
   if [ "$ROLE_MODE" = "worker-only" ] && [ "$ACTION" = "up" ] && [ -z "$HEAD_IP" ]; then
@@ -418,7 +497,8 @@ confirm_bootstrap_or_die() {
   die "Missing local artifacts ($reason). Local-only rule blocks unapproved downloads; pass --approve-download to authorize first-time cache population."
 }
 
-download_local_weights() {
+download_local_repo() {
+  local repo_id="$1"
   mkdir -p "$HF_CACHE_DIR"
   local token_args=()
   if [ -n "${HF_TOKEN:-}" ]; then
@@ -430,7 +510,12 @@ download_local_weights() {
     "${token_args[@]}" \
     -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
     "$VLLM_IMAGE" \
-    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$MODEL')"
+    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$repo_id')"
+}
+
+resolved_quant_dir() {
+  local slug="${MODEL//\//--}"
+  printf '%s/%s-%s\n' "${QUANT_BASE_DIR%/}" "$slug" "$QUANT_SCHEME"
 }
 
 ensure_artifacts_ready() {
@@ -438,20 +523,31 @@ ensure_artifacts_ready() {
     return 0
   fi
 
-  local head_img_ok=0 head_wt_ok=0 worker_img_ok=1 worker_wt_ok=1
+  local need_draft=0
+  [ "$SPEC_MODE" = "draft" ] && need_draft=1
+
+  local head_img_ok=0 head_wt_ok=0 head_draft_ok=1
+  local worker_img_ok=1 worker_wt_ok=1 worker_draft_ok=1
   has_local_image && head_img_ok=1 || true
   has_local_weights "$MODEL" "$HF_CACHE_DIR" && head_wt_ok=1 || true
+  if [ "$need_draft" = "1" ]; then
+    head_draft_ok=0
+    has_local_weights "$DRAFT_MODEL" "$HF_CACHE_DIR" && head_draft_ok=1 || true
+  fi
 
   if [ "$ROLE_MODE" = "cluster" ]; then
     local out
-    out="$(ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" <<'REMOTE_EOF'
+    out="$(ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" "$need_draft" "$DRAFT_MODEL" <<'REMOTE_EOF'
 set -euo pipefail
 # ROLE=check_cache
 img="$1"
 mdl="$2"
+need_dr="$3"
+dr_mdl="$4"
 cdir="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
 img_ok=0
 wt_ok=0
+dr_ok=1
 docker image inspect "$img" >/dev/null 2>&1 && img_ok=1 || true
 sub="models--${mdl//\//--}"
 if [ -d "$mdl" ] && compgen -G "$mdl/*.safetensors" >/dev/null; then
@@ -459,18 +555,33 @@ if [ -d "$mdl" ] && compgen -G "$mdl/*.safetensors" >/dev/null; then
 elif compgen -G "$cdir/hub/$sub/snapshots/*/*.safetensors" >/dev/null; then
   wt_ok=1
 fi
-printf 'IMAGE_OK=%s\nWEIGHTS_OK=%s\n' "$img_ok" "$wt_ok"
+if [ "$need_dr" = "1" ]; then
+  dr_ok=0
+  dr_sub="models--${dr_mdl//\//--}"
+  if [ -d "$dr_mdl" ] && compgen -G "$dr_mdl/*.safetensors" >/dev/null; then
+    dr_ok=1
+  elif compgen -G "$cdir/hub/$dr_sub/snapshots/*/*.safetensors" >/dev/null; then
+    dr_ok=1
+  fi
+fi
+printf 'IMAGE_OK=%s\nWEIGHTS_OK=%s\nDRAFT_OK=%s\n' "$img_ok" "$wt_ok" "$dr_ok"
 REMOTE_EOF
 )"
     worker_img_ok="$(printf '%s\n' "$out" | awk -F= '/^IMAGE_OK=/ { print $2; exit }')"
     worker_wt_ok="$(printf '%s\n' "$out" | awk -F= '/^WEIGHTS_OK=/ { print $2; exit }')"
+    if [ "$need_draft" = "1" ]; then
+      worker_draft_ok="$(printf '%s\n' "$out" | awk -F= '/^DRAFT_OK=/ { print $2; exit }')"
+      [ -n "$worker_draft_ok" ] || worker_draft_ok=1
+    fi
   fi
 
   local missing=()
   [ "$head_img_ok" = "1" ] || missing+=("Spark1:image:$VLLM_IMAGE")
   [ "$head_wt_ok" = "1" ] || missing+=("Spark1:weights:$MODEL")
+  [ "$head_draft_ok" = "1" ] || missing+=("Spark1:draft:$DRAFT_MODEL")
   [ "$worker_img_ok" = "1" ] || missing+=("Spark2:image:$VLLM_IMAGE")
   [ "$worker_wt_ok" = "1" ] || missing+=("Spark2:weights:$MODEL")
+  [ "$worker_draft_ok" = "1" ] || missing+=("Spark2:draft:$DRAFT_MODEL")
 
   if [ "${#missing[@]}" -eq 0 ]; then
     return 0
@@ -482,28 +593,33 @@ REMOTE_EOF
     docker pull "$VLLM_IMAGE"
   fi
   if [ "$head_wt_ok" != "1" ]; then
-    download_local_weights
+    download_local_repo "$MODEL"
+  fi
+  if [ "$head_draft_ok" != "1" ]; then
+    download_local_repo "$DRAFT_MODEL"
   fi
 
-  if [ "$ROLE_MODE" = "cluster" ] && { [ "$worker_img_ok" != "1" ] || [ "$worker_wt_ok" != "1" ]; }; then
-    ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" "$worker_img_ok" "$worker_wt_ok" <<REMOTE_EOF
+  if [ "$ROLE_MODE" = "cluster" ] && { [ "$worker_img_ok" != "1" ] || [ "$worker_wt_ok" != "1" ] || [ "$worker_draft_ok" != "1" ]; }; then
+    ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" "$worker_img_ok" "$worker_wt_ok" "$worker_draft_ok" "$DRAFT_MODEL" <<REMOTE_EOF
 set -euo pipefail
 # ROLE=bootstrap
 img="\$1"
 mdl="\$2"
 img_ok="\$3"
 wt_ok="\$4"
+dr_ok="\$5"
+dr_mdl="\$6"
 cdir="\${HF_CACHE_DIR:-\$HOME/.cache/huggingface}"
 mkdir -p "\$cdir"
 if [ "\$img_ok" != "1" ]; then
   docker pull "\$img"
 fi
+export HF_TOKEN="${HF_TOKEN:-}"
+token_flag=()
+if [ -n "\$HF_TOKEN" ]; then
+  token_flag=(-e HF_TOKEN)
+fi
 if [ "\$wt_ok" != "1" ]; then
-  export HF_TOKEN="${HF_TOKEN:-}"
-  token_flag=()
-  if [ -n "\$HF_TOKEN" ]; then
-    token_flag=(-e HF_TOKEN)
-  fi
   docker run --rm \
     -e HF_HUB_DISABLE_TELEMETRY=1 \
     -e DO_NOT_TRACK=1 \
@@ -511,6 +627,15 @@ if [ "\$wt_ok" != "1" ]; then
     -v "\$cdir:/root/.cache/huggingface" \
     "\$img" \
     python3 -c "from huggingface_hub import snapshot_download; snapshot_download('\$mdl')"
+fi
+if [ "\$dr_ok" != "1" ]; then
+  docker run --rm \
+    -e HF_HUB_DISABLE_TELEMETRY=1 \
+    -e DO_NOT_TRACK=1 \
+    "\${token_flag[@]}" \
+    -v "\$cdir:/root/.cache/huggingface" \
+    "\$img" \
+    python3 -c "from huggingface_hub import snapshot_download; snapshot_download('\$dr_mdl')"
 fi
 REMOTE_EOF
   fi
@@ -540,11 +665,23 @@ build_common_docker_env() {
 build_model_mount_args() {
   MODEL_MOUNT_ARGS=(-v "$HF_CACHE_DIR:/root/.cache/huggingface")
   CONTAINER_MODEL_REF="$MODEL"
-  if [ -d "$MODEL" ]; then
+  CONTAINER_DRAFT_REF="$DRAFT_MODEL"
+  if [ "$QUANT_SCHEME" != "none" ]; then
+    local qdir
+    qdir="$(resolved_quant_dir)"
+    MODEL_MOUNT_ARGS+=(-v "$qdir:/models/target:ro")
+    CONTAINER_MODEL_REF="/models/target"
+  elif [ -d "$MODEL" ]; then
     local abs_model
     abs_model="$(cd "$MODEL" && pwd)"
     MODEL_MOUNT_ARGS+=(-v "$abs_model:/models/target:ro")
     CONTAINER_MODEL_REF="/models/target"
+  fi
+  if [ "$SPEC_MODE" = "draft" ] && [ -d "$DRAFT_MODEL" ]; then
+    local abs_draft
+    abs_draft="$(cd "$DRAFT_MODEL" && pwd)"
+    MODEL_MOUNT_ARGS+=(-v "$abs_draft:/models/draft:ro")
+    CONTAINER_DRAFT_REF="/models/draft"
   fi
 }
 
@@ -666,7 +803,11 @@ wait_for_ray_cluster() {
 
 build_vllm_serve_cmd() {
   build_model_mount_args
-  local args=(
+  local serve_dtype="bfloat16"
+  if [ "$QUANT_SCHEME" != "none" ]; then
+    serve_dtype="auto"
+  fi
+  VLLM_SERVE_ARGS=(
     vllm serve "$CONTAINER_MODEL_REF"
     --served-model-name "$MODEL"
     --host "$API_HOST"
@@ -674,34 +815,48 @@ build_vllm_serve_cmd() {
     --tensor-parallel-size 2
     --pipeline-parallel-size 1
     --distributed-executor-backend ray
-    --dtype bfloat16
+    --dtype "$serve_dtype"
     --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN"
     --chat-template-content-format string
     --compilation-config.pass_config.fuse_allreduce_rms false
   )
   if [ "$KV_CACHE_DTYPE" != "auto" ]; then
-    args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+    VLLM_SERVE_ARGS+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
   fi
   if [ "$ENABLE_PREFIX_CACHING" = "1" ]; then
-    args+=(--enable-prefix-caching)
+    VLLM_SERVE_ARGS+=(--enable-prefix-caching)
   fi
+  case "$SPEC_MODE" in
+    draft)
+      local spec_json
+      spec_json="$(printf '{"method":"draft_model","model":"%s","num_speculative_tokens":%s}' "$CONTAINER_DRAFT_REF" "$SPEC_TOKENS")"
+      VLLM_SERVE_ARGS+=(--speculative-config "$spec_json")
+      ;;
+    ngram)
+      local spec_json
+      spec_json="$(printf '{"method":"ngram","num_speculative_tokens":%s,"prompt_lookup_max":%s}' "$SPEC_TOKENS" "$PROMPT_LOOKUP_MAX")"
+      VLLM_SERVE_ARGS+=(--speculative-config "$spec_json")
+      ;;
+    off)
+      ;;
+  esac
   case "$SERVE_MODE" in
     tools)
-      args+=(--enable-auto-tool-choice --tool-call-parser apertus)
+      VLLM_SERVE_ARGS+=(--enable-auto-tool-choice --tool-call-parser apertus)
       ;;
     thinking)
-      args+=(--reasoning-parser apertus --default-chat-template-kwargs.enable_thinking true)
+      VLLM_SERVE_ARGS+=(--reasoning-parser apertus --default-chat-template-kwargs.enable_thinking true)
       ;;
     plain)
       ;;
   esac
-  VLLM_SERVE_CMD="${args[*]}"
+  VLLM_SERVE_CMD="${VLLM_SERVE_ARGS[*]}"
 }
 
 start_vllm_serve() {
   build_vllm_serve_cmd
-  docker exec -d "$CONTAINER_NAME" bash -lc "$VLLM_SERVE_CMD >/tmp/vllm-serve.log 2>&1"
+  docker exec -d "$CONTAINER_NAME" bash -lc 'exec "$@" >/tmp/vllm-serve.log 2>&1' _ "${VLLM_SERVE_ARGS[@]}"
 }
 
 fetch_vllm_log_tail() {
@@ -808,6 +963,10 @@ KV_CACHE_DTYPE=$KV_CACHE_DTYPE
 ENABLE_PREFIX_CACHING=$ENABLE_PREFIX_CACHING
 GPU_MEM_UTIL=$GPU_MEM_UTIL
 SERVE_MODE=$SERVE_MODE
+QUANT_SCHEME=$QUANT_SCHEME
+SPEC_MODE=$SPEC_MODE
+DRAFT_MODEL=$DRAFT_MODEL
+SPEC_TOKENS=$SPEC_TOKENS
 API_HOST=$API_HOST
 API_PORT=$API_PORT
 HF_CACHE_DIR=$HF_CACHE_DIR

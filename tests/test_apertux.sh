@@ -211,9 +211,11 @@ if printf '%s' "$stdin_payload" | grep -Fq "ROLE=assign_ip"; then
 fi
 if printf '%s' "$stdin_payload" | grep -Fq "ROLE=check_cache"; then
   if [ "${MOCK_WORKER_MISSING_WEIGHTS:-0}" = "1" ] && [ ! -f "${MOCK_STATE_DIR}/worker_downloaded" ]; then
-    printf 'IMAGE_OK=1\nWEIGHTS_OK=0\n'
+    printf 'IMAGE_OK=1\nWEIGHTS_OK=0\nDRAFT_OK=1\n'
+  elif [ "${MOCK_WORKER_MISSING_DRAFT:-0}" = "1" ] && [ ! -f "${MOCK_STATE_DIR}/worker_downloaded" ]; then
+    printf 'IMAGE_OK=1\nWEIGHTS_OK=1\nDRAFT_OK=0\n'
   else
-    printf 'IMAGE_OK=1\nWEIGHTS_OK=1\n'
+    printf 'IMAGE_OK=1\nWEIGHTS_OK=1\nDRAFT_OK=1\n'
   fi
   exit 0
 fi
@@ -588,12 +590,56 @@ PY
   assert_contains "$readme" "Oleg Lavrovsky" "README credits Oleg Lavrovsky"
 }
 
+test_turbo_specdec_and_draft_gate() {
+  local sb out rc cmds
+  sb="$(make_sandbox)"
+
+  # 1. --turbo preset dry-run config + speculative-config draft_model JSON + --dtype auto
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" QUANT_BASE_DIR="$sb/quant" bash "$SCRIPT" up --worker nvidia@spark2 --turbo --dry-run 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "--turbo dry-run exits 0"
+  assert_contains "$out" "QUANT_SCHEME=nvfp4" "--turbo defaults QUANT_SCHEME=nvfp4"
+  assert_contains "$out" "SPEC_MODE=draft" "--turbo defaults SPEC_MODE=draft"
+  assert_contains "$out" "DRAFT_MODEL=swiss-ai/Apertus-v1.1-1.5B-Instruct" "--turbo defaults draft model to Apertus-v1.1-1.5B-Instruct"
+  assert_contains "$out" "--dtype auto" "quantized serve uses --dtype auto for compressed-tensors"
+  assert_contains "$out" '--speculative-config {"method":"draft_model","model":"swiss-ai/Apertus-v1.1-1.5B-Instruct","num_speculative_tokens":5}' "--turbo builds draft_model speculative-config"
+
+  # 2. --spec-mode ngram builds ngram speculative-config without draft model
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --quant fp8 --spec-mode ngram --spec-tokens 6 --prompt-lookup-max 4 --dry-run 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "--spec-mode ngram dry-run exits 0"
+  assert_contains "$out" "QUANT_SCHEME=fp8" "--quant fp8 sets QUANT_SCHEME=fp8"
+  assert_contains "$out" '--speculative-config {"method":"ngram","num_speculative_tokens":6,"prompt_lookup_max":4}' "ngram builds lookup speculative-config"
+
+  # 3. Draft model local-only cache gate: rejects missing draft without --approve-download, downloads when approved
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 --spec-mode draft 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "missing local draft model aborts without --approve-download"
+  else
+    fail "missing local draft model aborts without --approve-download" "got exit 0"
+  fi
+  assert_contains "$out" "Apertus-v1.1-1.5B-Instruct" "missing draft error names draft checkpoint"
+
+  # Populate mock local draft cache after docker snapshot_download or test --approve-download
+  mkdir -p "$sb/hf/hub/models--swiss-ai--Apertus-v1.1-1.5B-Instruct/snapshots/def456"
+  touch "$sb/hf/hub/models--swiss-ai--Apertus-v1.1-1.5B-Instruct/snapshots/def456/model.safetensors"
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log" "$sb/state/worker_downloaded"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_WORKER_MISSING_DRAFT=1 HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 --spec-mode draft --approve-download 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "draft mode succeeds and bootstraps missing worker draft when approved"
+  assert_contains "$(cat "$sb/state/ssh_stdin.log")" "ROLE=bootstrap" "worker bootstrap triggered for missing draft model"
+
+  rm -rf "$sb"
+}
+
 test_help_and_defaults
 test_fabric_discovery_and_preflight
 test_local_only_bootstrap_gate
 test_cluster_orchestration_and_modes
 test_liveness_smoke_status_and_pipe
 test_logo_assets
+test_turbo_specdec_and_draft_gate
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then
