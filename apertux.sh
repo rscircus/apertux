@@ -31,6 +31,17 @@ DRY_RUN=0
 FOLLOW_LOGS=0
 SMOKE_ENDPOINT=""
 
+HEAD_FABRIC_IFACE=""
+HEAD_FABRIC_IP=""
+RESOLVED_WORKER_IFACE=""
+WORKER_FABRIC_IP=""
+DOCKER_ENV_ARGS=()
+MODEL_MOUNT_ARGS=()
+CONTAINER_MODEL_REF=""
+VLLM_SERVE_CMD=""
+
+SPARK_CX7_IFACES="enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -216,14 +227,11 @@ parse_args() {
     fp8|fp8_e4m3|fp8_e5m2|auto) ;;
     *) die "Invalid --kv-cache-dtype '$KV_CACHE_DTYPE' (expected: fp8, auto)" ;;
   esac
+
+  if [ "$ROLE_MODE" = "worker-only" ] && [ "$ACTION" = "up" ] && [ -z "$HEAD_IP" ]; then
+    die "--worker-only requires --head-ip <spark1-200g-ipv4>"
+  fi
 }
-
-HEAD_FABRIC_IFACE=""
-HEAD_FABRIC_IP=""
-RESOLVED_WORKER_IFACE=""
-WORKER_FABRIC_IP=""
-
-SPARK_CX7_IFACES="enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1"
 
 check_host_preflight() {
   local arch
@@ -231,11 +239,11 @@ check_host_preflight() {
   if [ "$arch" != "aarch64" ] && [ "$ALLOW_ARCH_MISMATCH" != "1" ]; then
     die "Expected aarch64 (DGX Spark GB10), got '$arch' (use --allow-arch-mismatch to override)"
   fi
-  command -v docker >/dev/null 2>&1 || die "docker not found on Spark 1"
-  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found on Spark 1"
+  command -v docker >/dev/null 2>&1 || die "docker not found on local Spark"
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found on local Spark"
   if [ "$DRY_RUN" != "1" ]; then
-    docker info >/dev/null 2>&1 || die "docker daemon is not reachable on Spark 1"
-    nvidia-smi >/dev/null 2>&1 || die "nvidia-smi failed on Spark 1"
+    docker info >/dev/null 2>&1 || die "docker daemon is not reachable on local Spark"
+    nvidia-smi >/dev/null 2>&1 || die "nvidia-smi failed on local Spark"
   fi
 }
 
@@ -284,18 +292,20 @@ detect_local_fabric() {
   else
     HEAD_FABRIC_IFACE="$(find_active_cx7_iface || true)"
   fi
-  [ -n "$HEAD_FABRIC_IFACE" ] || die "No active ConnectX-7 200GbE port found on Spark 1 (check QSFP cable or pass --fabric-iface)"
+  [ -n "$HEAD_FABRIC_IFACE" ] || die "No active ConnectX-7 200GbE port found on local Spark (check QSFP cable or pass --fabric-iface)"
 
   HEAD_FABRIC_IP="$(extract_ipv4 "$HEAD_FABRIC_IFACE")"
-  if [ -z "$HEAD_FABRIC_IP" ]; then
-    if [ "$ASSIGN_FABRIC_IPS" = "1" ] && [ "$DRY_RUN" != "1" ]; then
-      sudo ip addr add "$HEAD_ASSIGN_CIDR" dev "$HEAD_FABRIC_IFACE"
-      sudo ip link set "$HEAD_FABRIC_IFACE" up
-      HEAD_FABRIC_IP="$(extract_ipv4 "$HEAD_FABRIC_IFACE")"
+  if [ -z "$HEAD_FABRIC_IP" ] && [ "$ASSIGN_FABRIC_IPS" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+    local target_cidr="$HEAD_ASSIGN_CIDR"
+    if [ "$ROLE_MODE" = "worker-only" ]; then
+      target_cidr="$WORKER_ASSIGN_CIDR"
     fi
+    sudo ip addr add "$target_cidr" dev "$HEAD_FABRIC_IFACE"
+    sudo ip link set "$HEAD_FABRIC_IFACE" up
+    HEAD_FABRIC_IP="$(extract_ipv4 "$HEAD_FABRIC_IFACE")"
   fi
   if [ -z "$HEAD_FABRIC_IP" ]; then
-    die "Interface $HEAD_FABRIC_IFACE has no IPv4 on Spark 1. Run 'sudo ip addr add $HEAD_ASSIGN_CIDR dev $HEAD_FABRIC_IFACE' or pass --assign-fabric-ips"
+    die "Interface $HEAD_FABRIC_IFACE has no IPv4. Run 'sudo ip addr add $HEAD_ASSIGN_CIDR dev $HEAD_FABRIC_IFACE' or pass --assign-fabric-ips"
   fi
 }
 
@@ -432,9 +442,7 @@ ensure_artifacts_ready() {
   has_local_image && head_img_ok=1 || true
   has_local_weights "$MODEL" "$HF_CACHE_DIR" && head_wt_ok=1 || true
 
-  local remote_cache_dir=""
   if [ "$ROLE_MODE" = "cluster" ]; then
-    # Default remote HF cache uses Spark 2's $HOME/.cache/huggingface unless HF_CACHE_DIR was explicitly overridden to a shared path
     local out
     out="$(ssh "$WORKER_SSH" bash -s -- "$VLLM_IMAGE" "$MODEL" <<'REMOTE_EOF'
 set -euo pipefail
@@ -508,7 +516,208 @@ REMOTE_EOF
   fi
 }
 
+build_common_docker_env() {
+  local node_ip="$1"
+  local node_if="$2"
+  DOCKER_ENV_ARGS=(
+    -e "VLLM_HOST_IP=$node_ip"
+    -e "NCCL_SOCKET_IFNAME=$node_if"
+    -e "GLOO_SOCKET_IFNAME=$node_if"
+    -e "TP_SOCKET_IFNAME=$node_if"
+    -e "UCX_NET_DEVICES=$node_if"
+    -e "HF_HUB_OFFLINE=1"
+    -e "TRANSFORMERS_OFFLINE=1"
+    -e "VLLM_NO_USAGE_STATS=1"
+    -e "DO_NOT_TRACK=1"
+    -e "HF_HUB_DISABLE_TELEMETRY=1"
+    -e "RAY_USAGE_STATS_ENABLED=0"
+  )
+  if [ "$NCCL_IB_DISABLE" = "1" ]; then
+    DOCKER_ENV_ARGS+=(-e "NCCL_IB_DISABLE=1")
+  fi
+}
+
+build_model_mount_args() {
+  MODEL_MOUNT_ARGS=(-v "$HF_CACHE_DIR:/root/.cache/huggingface")
+  CONTAINER_MODEL_REF="$MODEL"
+  if [ -d "$MODEL" ]; then
+    local abs_model
+    abs_model="$(cd "$MODEL" && pwd)"
+    MODEL_MOUNT_ARGS+=(-v "$abs_model:/models/target:ro")
+    CONTAINER_MODEL_REF="/models/target"
+  fi
+}
+
+start_ray_head() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  build_common_docker_env "$HEAD_FABRIC_IP" "$HEAD_FABRIC_IFACE"
+  build_model_mount_args
+  mkdir -p "$HF_CACHE_DIR"
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --network host \
+    --ipc host \
+    --gpus all \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    "${DOCKER_ENV_ARGS[@]}" \
+    "${MODEL_MOUNT_ARGS[@]}" \
+    --entrypoint bash \
+    "$VLLM_IMAGE" \
+    -lc "ray start --head --node-ip-address=$HEAD_FABRIC_IP --port=$RAY_PORT --disable-usage-stats --block" >/dev/null
+}
+
+start_local_worker() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  build_common_docker_env "$HEAD_FABRIC_IP" "$HEAD_FABRIC_IFACE"
+  build_model_mount_args
+  mkdir -p "$HF_CACHE_DIR"
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --network host \
+    --ipc host \
+    --gpus all \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    "${DOCKER_ENV_ARGS[@]}" \
+    "${MODEL_MOUNT_ARGS[@]}" \
+    --entrypoint bash \
+    "$VLLM_IMAGE" \
+    -lc "ray start --address=$HEAD_IP:$RAY_PORT --node-ip-address=$HEAD_FABRIC_IP --disable-usage-stats --block" >/dev/null
+}
+
+start_remote_worker() {
+  ssh "$WORKER_SSH" bash -s -- \
+    "$CONTAINER_NAME" \
+    "$VLLM_IMAGE" \
+    "$HEAD_FABRIC_IP" \
+    "$RAY_PORT" \
+    "$WORKER_FABRIC_IP" \
+    "$RESOLVED_WORKER_IFACE" \
+    "$NCCL_IB_DISABLE" \
+    "$MODEL" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=start_worker
+cname="$1"
+img="$2"
+head_ip="$3"
+rport="$4"
+wip="$5"
+wif="$6"
+ib_dis="$7"
+mdl="$8"
+cdir="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+mkdir -p "$cdir"
+docker rm -f "$cname" >/dev/null 2>&1 || true
+extra_env=()
+if [ "$ib_dis" = "1" ]; then
+  extra_env+=(-e "NCCL_IB_DISABLE=1")
+fi
+extra_mounts=()
+if [ -d "$mdl" ]; then
+  abs_mdl="$(cd "$mdl" && pwd)"
+  extra_mounts+=(-v "$abs_mdl:/models/target:ro")
+fi
+docker run -d \
+  --name "$cname" \
+  --network host \
+  --ipc host \
+  --gpus all \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  -e "VLLM_HOST_IP=$wip" \
+  -e "NCCL_SOCKET_IFNAME=$wif" \
+  -e "GLOO_SOCKET_IFNAME=$wif" \
+  -e "TP_SOCKET_IFNAME=$wif" \
+  -e "UCX_NET_DEVICES=$wif" \
+  -e "HF_HUB_OFFLINE=1" \
+  -e "TRANSFORMERS_OFFLINE=1" \
+  -e "VLLM_NO_USAGE_STATS=1" \
+  -e "DO_NOT_TRACK=1" \
+  -e "HF_HUB_DISABLE_TELEMETRY=1" \
+  -e "RAY_USAGE_STATS_ENABLED=0" \
+  "${extra_env[@]}" \
+  -v "$cdir:/root/.cache/huggingface" \
+  "${extra_mounts[@]}" \
+  --entrypoint bash \
+  "$img" \
+  -lc "ray start --address=$head_ip:$rport --node-ip-address=$wip --disable-usage-stats --block" >/dev/null
+REMOTE_EOF
+}
+
+wait_for_ray_cluster() {
+  local max_tries="${APERTUX_RAY_WAIT_TRIES:-30}"
+  local i=1 status_out=""
+  while [ "$i" -le "$max_tries" ]; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || printf 'false')" != "true" ]; then
+      docker logs --tail 40 "$CONTAINER_NAME" >&2 || true
+      die "Head container $CONTAINER_NAME exited unexpectedly while starting Ray"
+    fi
+    status_out="$(docker exec "$CONTAINER_NAME" ray status 2>/dev/null || true)"
+    if printf '%s\n' "$status_out" | grep -Eq '2\.0.*GPU|[2-9]\.0/[2-9]\.0 GPU'; then
+      return 0
+    fi
+    sleep "${APERTUX_POLL_INTERVAL:-1}"
+    i=$((i + 1))
+  done
+  printf '%s\n' "$status_out" >&2
+  die "Timed out waiting for 2 GPUs to register in Ray cluster across Spark 1 and Spark 2"
+}
+
+build_vllm_serve_cmd() {
+  build_model_mount_args
+  local args=(
+    vllm serve "$CONTAINER_MODEL_REF"
+    --served-model-name "$MODEL"
+    --host "$API_HOST"
+    --port "$API_PORT"
+    --tensor-parallel-size 2
+    --pipeline-parallel-size 1
+    --distributed-executor-backend ray
+    --dtype bfloat16
+    --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --max-model-len "$MAX_MODEL_LEN"
+    --chat-template-content-format string
+    --compilation-config.pass_config.fuse_allreduce_rms false
+  )
+  if [ "$KV_CACHE_DTYPE" != "auto" ]; then
+    args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+  fi
+  if [ "$ENABLE_PREFIX_CACHING" = "1" ]; then
+    args+=(--enable-prefix-caching)
+  fi
+  case "$SERVE_MODE" in
+    tools)
+      args+=(--enable-auto-tool-choice --tool-call-parser apertus)
+      ;;
+    thinking)
+      args+=(--reasoning-parser apertus --default-chat-template-kwargs.enable_thinking true)
+      ;;
+    plain)
+      ;;
+  esac
+  VLLM_SERVE_CMD="${args[*]}"
+}
+
+start_vllm_serve() {
+  build_vllm_serve_cmd
+  docker exec -d "$CONTAINER_NAME" bash -lc "$VLLM_SERVE_CMD >/tmp/vllm-serve.log 2>&1"
+}
+
+cmd_down() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  if [ -n "$WORKER_SSH" ]; then
+    ssh "$WORKER_SSH" bash -s -- "$CONTAINER_NAME" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=stop_worker
+docker rm -f "$1" >/dev/null 2>&1 || true
+REMOTE_EOF
+  fi
+  printf 'Stopped %s.\n' "$CONTAINER_NAME"
+}
+
 print_config() {
+  build_vllm_serve_cmd
   cat <<EOF
 ACTION=$ACTION
 ROLE_MODE=$ROLE_MODE
@@ -528,24 +737,54 @@ API_HOST=$API_HOST
 API_PORT=$API_PORT
 HF_CACHE_DIR=$HF_CACHE_DIR
 NCCL_IB_DISABLE=$NCCL_IB_DISABLE
+VLLM_SERVE_CMD=$VLLM_SERVE_CMD
 EOF
+}
+
+cmd_up() {
+  check_host_preflight
+  detect_local_fabric
+  if [ "$ROLE_MODE" = "cluster" ]; then
+    detect_remote_fabric
+    verify_fabric_ping
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    print_config
+    return 0
+  fi
+  ensure_artifacts_ready
+
+  if [ "$ROLE_MODE" = "worker-only" ]; then
+    start_local_worker
+    printf 'Ray worker started on %s (%s) -> %s:%s\n' "$HEAD_FABRIC_IFACE" "$HEAD_FABRIC_IP" "$HEAD_IP" "$RAY_PORT"
+    return 0
+  fi
+
+  start_ray_head
+  if [ "$ROLE_MODE" = "cluster" ]; then
+    start_remote_worker
+  fi
+  wait_for_ray_cluster
+  start_vllm_serve
 }
 
 main() {
   parse_args "$@"
-  if [ "$ACTION" = "up" ]; then
-    check_host_preflight
-    detect_local_fabric
-    if [ "$ROLE_MODE" = "cluster" ]; then
-      detect_remote_fabric
-      verify_fabric_ping
-    fi
-    ensure_artifacts_ready
-  fi
-  if [ "$DRY_RUN" = "1" ]; then
-    print_config
-    exit 0
-  fi
+  case "$ACTION" in
+    up)
+      cmd_up
+      ;;
+    down)
+      cmd_down
+      ;;
+    *)
+      if [ "$DRY_RUN" = "1" ]; then
+        print_config
+        exit 0
+      fi
+      die "Subcommand '$ACTION' not implemented yet"
+      ;;
+  esac
 }
 
 main "$@"

@@ -395,9 +395,90 @@ test_local_only_bootstrap_gate() {
   rm -rf "$sb"
 }
 
+test_cluster_orchestration_and_modes() {
+  local sb out rc cmds ssh_in
+  sb="$(make_sandbox)"
+
+  # 1. Full cluster up in default tools mode with 262k + fp8 KV cache + prefix caching
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "cluster up exits 0"
+  cmds="$(cat "$sb/state/commands.log")"
+  ssh_in="$(cat "$sb/state/ssh_stdin.log")"
+
+  assert_contains "$cmds" "VLLM_HOST_IP=192.168.100.1" "head sets VLLM_HOST_IP to 200GbE IP"
+  assert_contains "$cmds" "NCCL_SOCKET_IFNAME=enp1s0f1np1" "head pins NCCL_SOCKET_IFNAME"
+  assert_contains "$cmds" "GLOO_SOCKET_IFNAME=enp1s0f1np1" "head pins GLOO_SOCKET_IFNAME"
+  assert_contains "$cmds" "TP_SOCKET_IFNAME=enp1s0f1np1" "head pins TP_SOCKET_IFNAME"
+  assert_contains "$cmds" "UCX_NET_DEVICES=enp1s0f1np1" "head pins UCX_NET_DEVICES"
+  assert_contains "$cmds" "HF_HUB_OFFLINE=1" "head enforces HF_HUB_OFFLINE=1"
+  assert_contains "$cmds" "VLLM_NO_USAGE_STATS=1" "head disables vLLM telemetry"
+  assert_contains "$cmds" "ray start --head --node-ip-address=192.168.100.1 --port=6379 --disable-usage-stats --block" "head starts Ray head on 200GbE IP"
+  assert_contains "$ssh_in" "ROLE=start_worker" "worker started over SSH inline payload"
+  assert_contains "$cmds" "192.168.100.1 6379 192.168.100.2 enp1s0f1np1" "worker SSH receives head IP, Ray port, worker IP, and CX7 iface"
+  assert_contains "$ssh_in" 'ray start --address=$head_ip:$rport --node-ip-address=$wip --disable-usage-stats --block' "worker joins head 200GbE Ray port"
+
+  assert_contains "$cmds" "vllm serve swiss-ai/Apertus-v1.5-70B" "vllm serve targets Apertus-v1.5-70B"
+  assert_contains "$cmds" "--tensor-parallel-size 2" "vllm serve sets TP=2"
+  assert_contains "$cmds" "--distributed-executor-backend ray" "vllm serve uses ray executor"
+  assert_contains "$cmds" "--kv-cache-dtype fp8" "vllm serve uses fp8 KV cache"
+  assert_contains "$cmds" "--enable-prefix-caching" "vllm serve enables prefix caching"
+  assert_contains "$cmds" "--max-model-len 262144" "vllm serve sets 262k context"
+  assert_contains "$cmds" "--compilation-config.pass_config.fuse_allreduce_rms false" "vllm serve disables fuse_allreduce_rms for TP>1 stability"
+  assert_contains "$cmds" "--enable-auto-tool-choice --tool-call-parser apertus" "tools mode enables apertus tool parser"
+
+  # 2. Thinking mode flags
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 --mode thinking 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "thinking mode cluster up exits 0"
+  cmds="$(cat "$sb/state/commands.log")"
+  assert_contains "$cmds" "--reasoning-parser apertus --default-chat-template-kwargs.enable_thinking true" "thinking mode configures reasoning parser"
+  assert_not_contains "$cmds" "--tool-call-parser" "thinking mode omits tool-call-parser"
+
+  # 3. Plain mode + --no-prefix-caching + --nccl-ib-disable
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" up --worker nvidia@spark2 --mode plain --no-prefix-caching --nccl-ib-disable 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "plain mode cluster up exits 0"
+  cmds="$(cat "$sb/state/commands.log")"
+  assert_contains "$cmds" "NCCL_IB_DISABLE=1" "--nccl-ib-disable sets NCCL_IB_DISABLE=1"
+  assert_not_contains "$cmds" "--enable-prefix-caching" "--no-prefix-caching omits prefix caching flag"
+  assert_not_contains "$cmds" "--tool-call-parser" "plain mode omits tool parser"
+  assert_not_contains "$cmds" "--reasoning-parser" "plain mode omits reasoning parser"
+
+  # 4. Standalone --worker-only mode
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" --worker-only 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "--worker-only without --head-ip fails"
+  else
+    fail "--worker-only without --head-ip fails" "got exit 0"
+  fi
+
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_HEAD_IP=192.168.100.2 HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" --worker-only --head-ip 192.168.100.1 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "--worker-only with --head-ip succeeds"
+  cmds="$(cat "$sb/state/commands.log")"
+  assert_contains "$cmds" "ray start --address=192.168.100.1:6379 --node-ip-address=192.168.100.2 --disable-usage-stats --block" "standalone worker joins head Ray"
+  assert_not_contains "$cmds" "ssh " "standalone worker makes zero SSH calls"
+
+  # 5. Teardown (down) across both nodes
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" bash "$SCRIPT" down --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "down --worker exits 0"
+  assert_contains "$(cat "$sb/state/commands.log")" "docker rm -f apertux-node" "down removes local apertux-node"
+  assert_contains "$(cat "$sb/state/ssh_stdin.log")" "ROLE=stop_worker" "down removes remote apertux-node over SSH"
+
+  rm -rf "$sb"
+}
+
 test_help_and_defaults
 test_fabric_discovery_and_preflight
 test_local_only_bootstrap_gate
+test_cluster_orchestration_and_modes
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then
