@@ -221,6 +221,14 @@ if printf '%s' "$stdin_payload" | grep -Fq "ROLE=bootstrap"; then
   touch "${MOCK_STATE_DIR}/worker_downloaded"
   exit 0
 fi
+if printf '%s' "$stdin_payload" | grep -Fq "ROLE=status_worker"; then
+  if [ "${MOCK_WORKER_STOPPED:-0}" = "1" ]; then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+  exit 0
+fi
 exit 0
 EOF
 
@@ -475,10 +483,66 @@ test_cluster_orchestration_and_modes() {
   rm -rf "$sb"
 }
 
+test_liveness_smoke_status_and_pipe() {
+  local sb out rc cmds
+  sb="$(make_sandbox)"
+
+  # 1. Traceback in /tmp/vllm-serve.log caught immediately during startup
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_HEALTH_FAIL=1 MOCK_VLLM_TRACEBACK=1 HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 APERTUX_POLL_INTERVAL=0 APERTUX_HEALTH_WAIT_TRIES=3 bash "$SCRIPT" up --worker nvidia@spark2 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "startup traceback in vllm log aborts non-zero"
+  else
+    fail "startup traceback in vllm log aborts non-zero" "got exit 0"
+  fi
+  assert_contains "$out" "Traceback" "startup failure surfaces recent vllm log lines"
+
+  # 2. Standalone smoke subcommand hits /v1/chat/completions
+  rm -f "$sb/state/commands.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" bash "$SCRIPT" smoke --endpoint http://127.0.0.1:8000 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "smoke subcommand exits 0"
+  assert_contains "$(cat "$sb/state/commands.log")" "http://127.0.0.1:8000/v1/chat/completions" "smoke calls /v1/chat/completions"
+  assert_contains "$out" "Apertus 70B ready on 2x DGX Spark." "smoke prints model completion"
+
+  # 3. status subcommand checks container, Ray GPUs, and /health
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" bash "$SCRIPT" status --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "status exits 0 when healthy"
+  assert_contains "$out" "2.0/2.0 GPU" "status reports Ray GPU count"
+
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_CONTAINER_STOPPED=1 bash "$SCRIPT" status 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "status exits non-zero when container is stopped"
+  else
+    fail "status exits non-zero when container is stopped" "got exit 0"
+  fi
+
+  # 4. logs subcommand surfaces /tmp/vllm-serve.log
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" bash "$SCRIPT" logs 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "logs subcommand exits 0"
+  assert_contains "$out" "Uvicorn running" "logs reads vllm-serve.log"
+
+  # 5. End-to-end piped curl | bash simulation ($0 == bash, stdin consumed by script)
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(cat "$SCRIPT" | PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" APERTUX_DISABLE_TTY_PROMPT=1 bash -s -- --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "piped curl | bash -s execution succeeds end-to-end"
+  cmds="$(cat "$sb/state/commands.log")"
+  assert_contains "$cmds" "/health" "up polls /health before declaring ready"
+  assert_contains "$cmds" "/v1/chat/completions" "up executes live curl chat completion check"
+  assert_contains "$out" "curl -sS http://" "up prints ready-to-use curl command for clients"
+
+  rm -rf "$sb"
+}
+
 test_help_and_defaults
 test_fabric_discovery_and_preflight
 test_local_only_bootstrap_gate
 test_cluster_orchestration_and_modes
+test_liveness_smoke_status_and_pipe
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then

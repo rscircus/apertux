@@ -704,6 +704,81 @@ start_vllm_serve() {
   docker exec -d "$CONTAINER_NAME" bash -lc "$VLLM_SERVE_CMD >/tmp/vllm-serve.log 2>&1"
 }
 
+fetch_vllm_log_tail() {
+  local lines="${1:-40}"
+  docker exec "$CONTAINER_NAME" bash -lc "tail -n $lines /tmp/vllm-serve.log 2>/dev/null || true" 2>/dev/null || true
+}
+
+wait_for_vllm_ready() {
+  local max_tries="${APERTUX_HEALTH_WAIT_TRIES:-180}"
+  local interval="${APERTUX_POLL_INTERVAL:-2}"
+  local i=1 log_tail=""
+  while [ "$i" -le "$max_tries" ]; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || printf 'false')" != "true" ]; then
+      docker logs --tail 40 "$CONTAINER_NAME" >&2 || true
+      die "Container $CONTAINER_NAME stopped while loading $MODEL"
+    fi
+    log_tail="$(fetch_vllm_log_tail 60)"
+    if printf '%s\n' "$log_tail" | grep -Eq 'Traceback \(most recent call last\)|OutOfMemoryError|RuntimeError:|NCCL ERROR'; then
+      printf '%s\n' "$log_tail" >&2
+      die "Fatal error detected in /tmp/vllm-serve.log during $MODEL startup"
+    fi
+    if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$interval" != "0" ]; then
+      sleep "$interval"
+    fi
+    i=$((i + 1))
+  done
+  fetch_vllm_log_tail 60 >&2
+  die "Timed out waiting for vLLM /health on port $API_PORT"
+}
+
+cmd_smoke() {
+  local endpoint="${SMOKE_ENDPOINT:-http://127.0.0.1:${API_PORT}}"
+  endpoint="${endpoint%/}"
+  local payload resp
+  payload="$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply in one short sentence confirming Apertus is online."}],"max_tokens":64,"temperature":0}' "$MODEL")"
+  resp="$(curl -fsS "${endpoint}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload")" || die "Smoke check failed against ${endpoint}/v1/chat/completions"
+  printf '%s\n' "$resp" | grep -Fq '"choices"' || die "Unexpected response from ${endpoint}/v1/chat/completions: $resp"
+  printf 'Smoke check OK: %s\n' "$resp"
+}
+
+cmd_status() {
+  local running
+  running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || printf 'false')"
+  if [ "$running" != "true" ]; then
+    die "Head container $CONTAINER_NAME is not running"
+  fi
+  if [ -n "$WORKER_SSH" ]; then
+    local wrun
+    wrun="$(ssh "$WORKER_SSH" bash -s -- "$CONTAINER_NAME" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=status_worker
+docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || printf 'false'
+REMOTE_EOF
+)"
+    [ "$wrun" = "true" ] || die "Worker container $CONTAINER_NAME on $WORKER_SSH is not running"
+  fi
+  printf '=== Ray Cluster ===\n'
+  docker exec "$CONTAINER_NAME" ray status
+  printf '=== HTTP Health ===\n'
+  curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null && printf 'HTTP :%s/health OK\n' "$API_PORT"
+  printf '=== Recent vLLM Logs ===\n'
+  fetch_vllm_log_tail 20
+}
+
+cmd_logs() {
+  if [ "$FOLLOW_LOGS" = "1" ]; then
+    docker exec "$CONTAINER_NAME" bash -lc "tail -n 100 -f /tmp/vllm-serve.log"
+  else
+    fetch_vllm_log_tail 100
+  fi
+}
+
 cmd_down() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   if [ -n "$WORKER_SSH" ]; then
@@ -741,6 +816,17 @@ VLLM_SERVE_CMD=$VLLM_SERVE_CMD
 EOF
 }
 
+print_client_curl_hint() {
+  local host_hint="${HEAD_FABRIC_IP:-127.0.0.1}"
+  cat <<EOF
+
+Apertus is live across 2x DGX Spark (TP=2). Query from any reachable host:
+curl -sS http://${host_hint}:${API_PORT}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${MODEL}","messages":[{"role":"user","content":"Gruezi! Explain Switzerland in two sentences."}],"max_tokens":128}'
+EOF
+}
+
 cmd_up() {
   check_host_preflight
   detect_local_fabric
@@ -766,10 +852,17 @@ cmd_up() {
   fi
   wait_for_ray_cluster
   start_vllm_serve
+  wait_for_vllm_ready
+  cmd_smoke
+  print_client_curl_hint
 }
 
 main() {
   parse_args "$@"
+  if [ "$DRY_RUN" = "1" ] && [ "$ACTION" != "up" ]; then
+    print_config
+    exit 0
+  fi
   case "$ACTION" in
     up)
       cmd_up
@@ -777,12 +870,14 @@ main() {
     down)
       cmd_down
       ;;
-    *)
-      if [ "$DRY_RUN" = "1" ]; then
-        print_config
-        exit 0
-      fi
-      die "Subcommand '$ACTION' not implemented yet"
+    status)
+      cmd_status
+      ;;
+    smoke)
+      cmd_smoke
+      ;;
+    logs)
+      cmd_logs
       ;;
   esac
 }
