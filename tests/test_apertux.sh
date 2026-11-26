@@ -291,7 +291,68 @@ test_help_and_defaults() {
   rm -rf "$sb"
 }
 
+test_fabric_discovery_and_preflight() {
+  local sb out rc
+  sb="$(make_sandbox)"
+
+  # 1. ibdev2netdev discovery across head + SSH worker
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --dry-run 2>&1)" || rc=$?
+  assert_eq "0" "${rc:-0}" "fabric discovery succeeds in dry-run"
+  assert_contains "$out" "HEAD_FABRIC_IFACE=enp1s0f1np1" "head ConnectX-7 interface detected"
+  assert_contains "$out" "HEAD_FABRIC_IP=192.168.100.1" "head 200GbE IPv4 detected"
+  assert_contains "$out" "WORKER_FABRIC_IFACE=enp1s0f1np1" "worker ConnectX-7 interface detected over SSH"
+  assert_contains "$out" "WORKER_FABRIC_IP=192.168.100.2" "worker 200GbE IPv4 detected over SSH"
+
+  # 2. Fallback to ip link scan when ibdev2netdev is absent
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_NO_IBDEV=1 HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --dry-run 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "fallback ip link scan succeeds without ibdev2netdev"
+  assert_contains "$out" "HEAD_FABRIC_IFACE=enp1s0f0np0" "fallback selects first LOWER_UP Spark CX7 interface"
+
+  # 3. Non-aarch64 rejected unless --allow-arch-mismatch
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_ARCH=x86_64 HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --dry-run 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "x86_64 rejected by default"
+  else
+    fail "x86_64 rejected by default" "got exit 0"
+  fi
+  assert_contains "$out" "aarch64" "arch error mentions aarch64"
+
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_ARCH=x86_64 HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --allow-arch-mismatch --dry-run 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "--allow-arch-mismatch bypasses arch guard"
+
+  # 4. Missing IPv4 fails without --assign-fabric-ips, succeeds with --assign-fabric-ips
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_HEAD_NO_IP=1 HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --dry-run 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "missing 200GbE IPv4 fails cleanly"
+  else
+    fail "missing 200GbE IPv4 fails cleanly" "got exit 0"
+  fi
+  assert_contains "$out" "ip addr add" "missing IP error gives ip addr add hint"
+
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_HEAD_NO_IP=1 MOCK_WORKER_NO_IP=1 HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 --assign-fabric-ips 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "--assign-fabric-ips assigns head and worker IPs"
+  assert_contains "$(cat "$sb/state/commands.log")" "ip addr add 192.168.100.1/24 dev enp1s0f1np1" "head IP assigned via ip addr add"
+  assert_contains "$(cat "$sb/state/ssh_stdin.log")" "ROLE=assign_ip" "worker IP assigned over SSH"
+
+  # 5. Ping failure over fabric caught
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_PING_FAIL=1 HF_CACHE_DIR="$sb/hf" bash "$SCRIPT" up --worker nvidia@spark2 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "200GbE ping failure aborts startup"
+  else
+    fail "200GbE ping failure aborts startup" "got exit 0"
+  fi
+
+  rm -rf "$sb"
+}
+
 test_help_and_defaults
+test_fabric_discovery_and_preflight
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then

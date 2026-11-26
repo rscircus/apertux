@@ -218,6 +218,154 @@ parse_args() {
   esac
 }
 
+HEAD_FABRIC_IFACE=""
+HEAD_FABRIC_IP=""
+RESOLVED_WORKER_IFACE=""
+WORKER_FABRIC_IP=""
+
+SPARK_CX7_IFACES="enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1"
+
+check_host_preflight() {
+  local arch
+  arch="$(uname -m)"
+  if [ "$arch" != "aarch64" ] && [ "$ALLOW_ARCH_MISMATCH" != "1" ]; then
+    die "Expected aarch64 (DGX Spark GB10), got '$arch' (use --allow-arch-mismatch to override)"
+  fi
+  command -v docker >/dev/null 2>&1 || die "docker not found on Spark 1"
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found on Spark 1"
+  if [ "$DRY_RUN" != "1" ]; then
+    docker info >/dev/null 2>&1 || die "docker daemon is not reachable on Spark 1"
+    nvidia-smi >/dev/null 2>&1 || die "nvidia-smi failed on Spark 1"
+  fi
+}
+
+extract_ipv4() {
+  local iface="$1"
+  ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{
+    for (i = 1; i <= NF; i++) {
+      if ($i == "inet") {
+        sub(/\/.*/, "", $(i + 1))
+        print $(i + 1)
+        exit
+      }
+    }
+  }'
+}
+
+find_active_cx7_iface() {
+  local cand
+  if command -v ibdev2netdev >/dev/null 2>&1; then
+    cand="$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "==>") {
+          print $(i + 1)
+          exit
+        }
+      }
+    }' || true)"
+    if [ -n "$cand" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  fi
+
+  for cand in $SPARK_CX7_IFACES; do
+    if ip link show dev "$cand" 2>/dev/null | grep -Fq "LOWER_UP"; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_local_fabric() {
+  if [ -n "$FABRIC_IFACE" ]; then
+    HEAD_FABRIC_IFACE="$FABRIC_IFACE"
+  else
+    HEAD_FABRIC_IFACE="$(find_active_cx7_iface || true)"
+  fi
+  [ -n "$HEAD_FABRIC_IFACE" ] || die "No active ConnectX-7 200GbE port found on Spark 1 (check QSFP cable or pass --fabric-iface)"
+
+  HEAD_FABRIC_IP="$(extract_ipv4 "$HEAD_FABRIC_IFACE")"
+  if [ -z "$HEAD_FABRIC_IP" ]; then
+    if [ "$ASSIGN_FABRIC_IPS" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+      sudo ip addr add "$HEAD_ASSIGN_CIDR" dev "$HEAD_FABRIC_IFACE"
+      sudo ip link set "$HEAD_FABRIC_IFACE" up
+      HEAD_FABRIC_IP="$(extract_ipv4 "$HEAD_FABRIC_IFACE")"
+    fi
+  fi
+  if [ -z "$HEAD_FABRIC_IP" ]; then
+    die "Interface $HEAD_FABRIC_IFACE has no IPv4 on Spark 1. Run 'sudo ip addr add $HEAD_ASSIGN_CIDR dev $HEAD_FABRIC_IFACE' or pass --assign-fabric-ips"
+  fi
+}
+
+detect_remote_fabric() {
+  [ -n "$WORKER_SSH" ] || die "--worker <user@spark2> is required in cluster mode (or pass --head)"
+  local out
+  out="$(ssh "$WORKER_SSH" bash -s -- "$WORKER_FABRIC_IFACE" "$ALLOW_ARCH_MISMATCH" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=detect_fabric
+req_iface="${1:-}"
+allow_arch="${2:-0}"
+arch="$(uname -m)"
+if [ "$arch" != "aarch64" ] && [ "$allow_arch" != "1" ]; then
+  printf 'ERROR: Spark 2 arch is %s, expected aarch64\n' "$arch" >&2
+  exit 1
+fi
+if [ -n "$req_iface" ]; then
+  iface="$req_iface"
+else
+  iface=""
+  if command -v ibdev2netdev >/dev/null 2>&1; then
+    iface="$(ibdev2netdev 2>/dev/null | awk '/\(Up\)/ { for (i=1; i<=NF; i++) if ($i=="==>") { print $(i+1); exit } }' || true)"
+  fi
+  if [ -z "$iface" ]; then
+    for c in enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1; do
+      if ip link show dev "$c" 2>/dev/null | grep -Fq "LOWER_UP"; then
+        iface="$c"
+        break
+      fi
+    done
+  fi
+fi
+[ -n "$iface" ] || { printf 'ERROR: No active ConnectX-7 port found on Spark 2\n' >&2; exit 1; }
+ip4="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i=="inet") { sub(/\/.*/, "", $(i+1)); print $(i+1); exit } }')"
+printf 'IFACE=%s\nIP=%s\n' "$iface" "$ip4"
+REMOTE_EOF
+)"
+  RESOLVED_WORKER_IFACE="$(printf '%s\n' "$out" | awk -F= '/^IFACE=/ { print $2; exit }')"
+  WORKER_FABRIC_IP="$(printf '%s\n' "$out" | awk -F= '/^IP=/ { print $2; exit }')"
+
+  if [ -z "$WORKER_FABRIC_IP" ] && [ "$ASSIGN_FABRIC_IPS" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+    ssh "$WORKER_SSH" bash -s -- "$RESOLVED_WORKER_IFACE" "$WORKER_ASSIGN_CIDR" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=assign_ip
+sudo ip addr add "$2" dev "$1"
+sudo ip link set "$1" up
+REMOTE_EOF
+    out="$(ssh "$WORKER_SSH" bash -s -- "$RESOLVED_WORKER_IFACE" "$ALLOW_ARCH_MISMATCH" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=detect_fabric
+iface="$1"
+ip4="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i=="inet") { sub(/\/.*/, "", $(i+1)); print $(i+1); exit } }')"
+printf 'IFACE=%s\nIP=%s\n' "$iface" "$ip4"
+REMOTE_EOF
+)"
+    WORKER_FABRIC_IP="$(printf '%s\n' "$out" | awk -F= '/^IP=/ { print $2; exit }')"
+  fi
+
+  if [ -z "$WORKER_FABRIC_IP" ]; then
+    die "Interface $RESOLVED_WORKER_IFACE has no IPv4 on Spark 2 ($WORKER_SSH). Run 'sudo ip addr add $WORKER_ASSIGN_CIDR dev $RESOLVED_WORKER_IFACE' or pass --assign-fabric-ips"
+  fi
+}
+
+verify_fabric_ping() {
+  if [ "$DRY_RUN" = "1" ]; then
+    return 0
+  fi
+  ping -c 1 -W 2 "$WORKER_FABRIC_IP" >/dev/null 2>&1 || die "Cannot reach Spark 2 over 200GbE fabric ($HEAD_FABRIC_IP -> $WORKER_FABRIC_IP on $HEAD_FABRIC_IFACE)"
+}
+
 print_config() {
   cat <<EOF
 ACTION=$ACTION
@@ -225,6 +373,10 @@ ROLE_MODE=$ROLE_MODE
 WORKER_SSH=$WORKER_SSH
 MODEL=$MODEL
 VLLM_IMAGE=$VLLM_IMAGE
+HEAD_FABRIC_IFACE=$HEAD_FABRIC_IFACE
+HEAD_FABRIC_IP=$HEAD_FABRIC_IP
+WORKER_FABRIC_IFACE=$RESOLVED_WORKER_IFACE
+WORKER_FABRIC_IP=$WORKER_FABRIC_IP
 MAX_MODEL_LEN=$MAX_MODEL_LEN
 KV_CACHE_DTYPE=$KV_CACHE_DTYPE
 ENABLE_PREFIX_CACHING=$ENABLE_PREFIX_CACHING
@@ -239,6 +391,14 @@ EOF
 
 main() {
   parse_args "$@"
+  if [ "$ACTION" = "up" ]; then
+    check_host_preflight
+    detect_local_fabric
+    if [ "$ROLE_MODE" = "cluster" ]; then
+      detect_remote_fabric
+      verify_fabric_ping
+    fi
+  fi
   if [ "$DRY_RUN" = "1" ]; then
     print_config
     exit 0
