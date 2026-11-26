@@ -186,6 +186,29 @@ case "${1:-}" in
     exit 0
     ;;
   run|rm|stop)
+    if [ "${1:-}" = "run" ] && printf '%s' "$*" | grep -Fq "import llmcompressor"; then
+      if [ "${MOCK_MISSING_LLMCOMPRESSOR:-0}" = "1" ] && [ ! -f "${MOCK_STATE_DIR}/wheels_installed" ]; then
+        exit 1
+      fi
+      exit 0
+    fi
+    if [ "${1:-}" = "run" ] && printf '%s' "$*" | grep -Fq "pip download"; then
+      touch "${MOCK_STATE_DIR}/wheels_installed"
+      exit 0
+    fi
+    if [ "${1:-}" = "run" ] && printf '%s' "$*" | grep -Fq "APERTUX_RUN_QUANTIZER=1"; then
+      for arg in "$@"; do
+        case "$arg" in
+          *:/quant_out)
+            host_qdir="${arg%:/quant_out}"
+            mkdir -p "$host_qdir"
+            touch "$host_qdir/model-00001-of-00008.safetensors"
+            printf '{"source_model":"swiss-ai/Apertus-v1.5-70B","scheme":"NVFP4"}\n' >"$host_qdir/apertux_quant_meta.json"
+            ;;
+        esac
+      done
+      exit 0
+    fi
     exit 0
     ;;
 esac
@@ -231,6 +254,19 @@ if printf '%s' "$stdin_payload" | grep -Fq "ROLE=status_worker"; then
   fi
   exit 0
 fi
+if printf '%s' "$stdin_payload" | grep -Fq "ROLE=check_quantized"; then
+  if [ -f "${MOCK_STATE_DIR}/worker_quant_synced" ]; then
+    printf 'QUANT_OK=1\n'
+  else
+    printf 'QUANT_OK=0\n'
+  fi
+  exit 0
+fi
+if printf '%s' "$*" | grep -Fq "ROLE=sync_quantized"; then
+  cat >/dev/null
+  touch "${MOCK_STATE_DIR}/worker_quant_synced"
+  exit 0
+fi
 exit 0
 EOF
 
@@ -245,7 +281,7 @@ if printf '%s' "$*" | grep -Fq "/health"; then
   exit 0
 fi
 if printf '%s' "$*" | grep -Fq "/v1/chat/completions"; then
-  printf '{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"Apertus 70B ready on 2x DGX Spark."}}]}\n'
+  printf '{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"Apertus 70B ready on 2x DGX Spark."}}],"usage":{"prompt_tokens":24,"completion_tokens":128,"total_tokens":152}}\n'
   exit 0
 fi
 exit 0
@@ -633,6 +669,61 @@ test_turbo_specdec_and_draft_gate() {
   rm -rf "$sb"
 }
 
+test_quantize_sync_bench_and_piped_turbo() {
+  local sb out rc cmds ssh_in
+  sb="$(make_sandbox)"
+  mkdir -p "$sb/hf/hub/models--swiss-ai--Apertus-v1.1-1.5B-Instruct/snapshots/def456"
+  touch "$sb/hf/hub/models--swiss-ai--Apertus-v1.1-1.5B-Instruct/snapshots/def456/model.safetensors"
+
+  # 1. Missing llmcompressor in container requires --approve-download under local-only rule
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" MOCK_MISSING_LLMCOMPRESSOR=1 HF_CACHE_DIR="$sb/hf" QUANT_BASE_DIR="$sb/quant" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" quantize --quant nvfp4 --worker nvidia@spark2 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "missing llmcompressor wheel aborts without --approve-download"
+  else
+    fail "missing llmcompressor wheel aborts without --approve-download" "got exit 0"
+  fi
+
+  # 2. quantize subcommand creates local NVFP4 checkpoint and syncs to Spark 2
+  rm -f "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" QUANT_BASE_DIR="$sb/quant" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" quantize --quant nvfp4 --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "quantize --quant nvfp4 succeeds"
+  cmds="$(cat "$sb/state/commands.log")"
+  assert_contains "$cmds" "APERTUX_RUN_QUANTIZER=1" "quantize launches container quantizer"
+  assert_contains "$cmds" "ROLE=sync_quantized" "quantize syncs compressed checkpoint to Spark 2"
+
+  # 3. Idempotent second quantize skips container quantizer when both Sparks have checkpoint
+  rm -f "$sb/state/commands.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" QUANT_BASE_DIR="$sb/quant" APERTUX_DISABLE_TTY_PROMPT=1 bash "$SCRIPT" quantize --quant nvfp4 --worker nvidia@spark2 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "second quantize exits 0 idempotently"
+  assert_not_contains "$(cat "$sb/state/commands.log")" "APERTUX_RUN_QUANTIZER=1" "idempotent quantize skips re-running llmcompressor"
+
+  # 4. bench subcommand reports completion_tokens and tok/s
+  rm -f "$sb/state/commands.log"
+  rc=0
+  out="$(PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" bash "$SCRIPT" bench --endpoint http://127.0.0.1:8000 --max-tokens 128 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "bench subcommand exits 0"
+  assert_contains "$out" "128 tokens" "bench reports generated completion_tokens"
+  assert_contains "$out" "tok/s" "bench reports decode throughput in tok/s"
+
+  # 5. End-to-end piped curl | bash --turbo (fresh quant dir, $0 == bash, embedded quantizer + worker /models/target mount)
+  rm -rf "$sb/quant" "$sb/state/worker_quant_synced" "$sb/state/commands.log" "$sb/state/ssh_stdin.log"
+  rc=0
+  out="$(cat "$SCRIPT" | PATH="$sb/bin:$PATH" MOCK_STATE_DIR="$sb/state" HF_CACHE_DIR="$sb/hf" QUANT_BASE_DIR="$sb/quant" APERTUX_DISABLE_TTY_PROMPT=1 bash -s -- --worker nvidia@spark2 --turbo 2>&1)" || rc=$?
+  assert_eq "0" "$rc" "piped curl | bash --turbo succeeds end-to-end"
+  cmds="$(cat "$sb/state/commands.log")"
+  ssh_in="$(cat "$sb/state/ssh_stdin.log")"
+  assert_contains "$cmds" "APERTUX_RUN_QUANTIZER=1" "piped --turbo runs embedded quantizer when checkpoint absent"
+  assert_contains "$cmds" "ROLE=sync_quantized" "piped --turbo syncs quantized checkpoint to Spark 2"
+  assert_contains "$cmds" ":/models/target:ro" "head mounts quantized checkpoint at /models/target"
+  assert_contains "$ssh_in" ":/models/target:ro" "worker mounts quantized checkpoint at /models/target"
+  assert_contains "$cmds" '--speculative-config {"method":"draft_model","model":"swiss-ai/Apertus-v1.1-1.5B-Instruct","num_speculative_tokens":5}' "piped --turbo passes draft speculative-config"
+
+  rm -rf "$sb"
+}
+
 test_help_and_defaults
 test_fabric_discovery_and_preflight
 test_local_only_bootstrap_gate
@@ -640,6 +731,7 @@ test_cluster_orchestration_and_modes
 test_liveness_smoke_status_and_pipe
 test_logo_assets
 test_turbo_specdec_and_draft_gate
+test_quantize_sync_bench_and_piped_turbo
 
 printf '\nSummary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then

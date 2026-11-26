@@ -57,7 +57,9 @@ SPARK_CX7_IFACES="enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1"
 usage() {
   cat <<'EOF'
 Usage:
-  apertux.sh [up] --worker <user@spark2> [options]
+  apertux.sh [up] --worker <user@spark2> [--turbo] [options]
+  apertux.sh quantize --quant <nvfp4|fp8> [--worker <user@spark2>] [options]
+  apertux.sh bench [--endpoint http://127.0.0.1:8000] [--max-tokens 256]
   apertux.sh --head [options]
   apertux.sh --worker-only --head-ip <200g-head-ip> [options]
   apertux.sh status [--worker <user@spark2>]
@@ -76,6 +78,17 @@ Defaults:
   API_PORT=8000
 
 Options:
+  --turbo                     Fast interactive preset: --quant nvfp4 --spec-mode draft
+  --quant <none|fp8|nvfp4>    Quantize/serve compressed-tensors weights
+  --quant-dir <dir>           Base directory for local quantized checkpoints
+  --calib-file <jsonl>        Local JSONL calibration file for NVFP4
+  --calib-samples <count>     Calibration sample count for NVFP4 (default: 128)
+  --force-quant               Re-run quantization even if checkpoint exists
+  --spec-mode <off|draft|ngram> Speculative decoding mode
+  --draft-model <hf-repo>     Draft model for --spec-mode draft (default: swiss-ai/Apertus-v1.1-1.5B-Instruct)
+  --spec-tokens <count>       Number of speculative tokens per step (default: 5)
+  --prompt-lookup-max <n>     Max prompt n-gram window for --spec-mode ngram (default: 4)
+  --max-tokens <tokens>       Completion tokens for bench subcommand (default: 256)
   --worker <user@host>        SSH target for Spark 2
   --head                      Start head node without SSH worker dispatch
   --worker-only               Start Ray worker container only (requires --head-ip)
@@ -724,6 +737,7 @@ start_local_worker() {
 }
 
 start_remote_worker() {
+  local quant_slug="${MODEL//\//--}-${QUANT_SCHEME}"
   ssh "$WORKER_SSH" bash -s -- \
     "$CONTAINER_NAME" \
     "$VLLM_IMAGE" \
@@ -732,7 +746,11 @@ start_remote_worker() {
     "$WORKER_FABRIC_IP" \
     "$RESOLVED_WORKER_IFACE" \
     "$NCCL_IB_DISABLE" \
-    "$MODEL" <<'REMOTE_EOF'
+    "$MODEL" \
+    "$QUANT_SCHEME" \
+    "$quant_slug" \
+    "$SPEC_MODE" \
+    "$DRAFT_MODEL" <<'REMOTE_EOF'
 set -euo pipefail
 # ROLE=start_worker
 cname="$1"
@@ -743,7 +761,12 @@ wip="$5"
 wif="$6"
 ib_dis="$7"
 mdl="$8"
+qscheme="$9"
+qslug="${10}"
+smode="${11}"
+dmdl="${12}"
 cdir="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+qbase="${QUANT_BASE_DIR:-$HOME/.cache/apertux/quantized}"
 mkdir -p "$cdir"
 docker rm -f "$cname" >/dev/null 2>&1 || true
 extra_env=()
@@ -751,9 +774,15 @@ if [ "$ib_dis" = "1" ]; then
   extra_env+=(-e "NCCL_IB_DISABLE=1")
 fi
 extra_mounts=()
-if [ -d "$mdl" ]; then
+if [ "$qscheme" != "none" ]; then
+  extra_mounts+=(-v "${qbase%/}/${qslug}:/models/target:ro")
+elif [ -d "$mdl" ]; then
   abs_mdl="$(cd "$mdl" && pwd)"
   extra_mounts+=(-v "$abs_mdl:/models/target:ro")
+fi
+if [ "$smode" = "draft" ] && [ -d "$dmdl" ]; then
+  abs_dr="$(cd "$dmdl" && pwd)"
+  extra_mounts+=(-v "$abs_dr:/models/draft:ro")
 fi
 docker run -d \
   --name "$cname" \
@@ -780,6 +809,210 @@ docker run -d \
   "$img" \
   -lc "ray start --address=$head_ip:$rport --node-ip-address=$wip --disable-usage-stats --block" >/dev/null
 REMOTE_EOF
+}
+
+has_local_quantized_checkpoint() {
+  local qdir="$1"
+  [ -f "$qdir/apertux_quant_meta.json" ] && compgen -G "$qdir/*.safetensors" >/dev/null
+}
+
+write_quantizer_script() {
+  local dst="$1"
+  local self_dir=""
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  fi
+  if [ -n "$self_dir" ] && [ -f "$self_dir/scripts/quantize_apertus.py" ]; then
+    cp "$self_dir/scripts/quantize_apertus.py" "$dst"
+    return 0
+  fi
+  cat >"$dst" <<'PY_EOF'
+#!/usr/bin/env python3
+import argparse
+import datetime
+import json
+import shutil
+from pathlib import Path
+
+SCHEME_MAP = {"fp8": "FP8_DYNAMIC", "nvfp4": "NVFP4"}
+IGNORE_MODULES = ["lm_head", "re:.*vision.*", "re:.*audio.*"]
+BUILTIN_CALIB_TEXTS = [
+    "Explain how coherent unified memory on Grace Blackwell affects dense transformer token generation.",
+    "Schreiben Sie eine kurze Zusammenfassung ueber die Schweizerische Eidgenossenschaft und ihre vier Landessprachen.",
+    "Redigez une fonction Python robuste qui parse un flux JSON Lines sans charger tout le fichier en memoire.",
+    "Scrivi una query SQL che calcola la latenza mediana e il percentile p99 per ciascun nodo del cluster.",
+    "def binary_search(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        if arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1",
+    "Step 1: Measure single-stream decode bandwidth. Step 2: Compare BF16 weight size against FP8 and NVFP4. Step 3: Verify speculative acceptance rate.",
+]
+
+def is_already_quantized(out_dir: Path, model_id: str, resolved_scheme: str) -> bool:
+    meta_file = out_dir / "apertux_quant_meta.json"
+    if not meta_file.is_file() or not any(out_dir.glob("*.safetensors")):
+        return False
+    try:
+        meta = json.loads(meta_file.read_text())
+    except ValueError:
+        return False
+    return meta.get("source_model") == model_id and meta.get("scheme") == resolved_scheme
+
+def build_calib_dataset(tokenizer, calib_file, count, max_seq_len):
+    from datasets import Dataset
+    texts = []
+    if calib_file:
+        for raw in Path(calib_file).read_text().splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            item = json.loads(raw)
+            if "messages" in item:
+                texts.append(tokenizer.apply_chat_template(item["messages"], tokenize=False))
+            elif "text" in item:
+                texts.append(str(item["text"]))
+    if not texts:
+        texts = list(BUILTIN_CALIB_TEXTS)
+    expanded = []
+    while len(expanded) < count:
+        for base in texts:
+            expanded.append(f"[sample {len(expanded) + 1}/{count}] {base}")
+            if len(expanded) >= count:
+                break
+    rows = [tokenizer(t, padding=False, max_length=max_seq_len, truncation=True, add_special_tokens=False) for t in expanded]
+    return Dataset.from_list(rows)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--scheme", choices=["fp8", "nvfp4"], default="nvfp4")
+    p.add_argument("--calib-file", default=None)
+    p.add_argument("--calib-samples", type=int, default=128)
+    p.add_argument("--max-seq-len", type=int, default=2048)
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args()
+    resolved_scheme = SCHEME_MAP[args.scheme]
+    out_dir = Path(args.output_dir)
+    if not args.force and is_already_quantized(out_dir, args.model, resolved_scheme):
+        return 0
+    from llmcompressor import oneshot
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    out_dir.mkdir(parents=True, exist_ok=True)
+    offload_dir = out_dir / ".offload_tmp"
+    offload_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        tok = AutoTokenizer.from_pretrained(args.model, local_files_only=True, trust_remote_code=True)
+        mdl = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype="auto", low_cpu_mem_usage=True, device_map="auto",
+            max_memory={0: "28GiB", "cpu": "64GiB"}, offload_folder=str(offload_dir),
+            local_files_only=True, trust_remote_code=True,
+        )
+        recipe = QuantizationModifier(targets="Linear", scheme=resolved_scheme, ignore=list(IGNORE_MODULES))
+        ds = build_calib_dataset(tok, args.calib_file, args.calib_samples, args.max_seq_len) if resolved_scheme == "NVFP4" else None
+        oneshot(model=mdl, recipe=recipe, dataset=ds, max_seq_length=args.max_seq_len, num_calibration_samples=args.calib_samples if ds is not None else 0)
+        mdl.save_pretrained(str(out_dir), save_compressed=True)
+        tok.save_pretrained(str(out_dir))
+        (out_dir / "apertux_quant_meta.json").write_text(json.dumps({"source_model": args.model, "scheme": resolved_scheme, "ignore": IGNORE_MODULES, "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}, indent=2) + "\n")
+    finally:
+        shutil.rmtree(offload_dir, ignore_errors=True)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY_EOF
+}
+
+ensure_llmcompressor_wheels() {
+  local wheel_dir="$HF_CACHE_DIR/apertux-wheels"
+  if docker run --rm "$VLLM_IMAGE" python3 -c "import llmcompressor" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -d "$wheel_dir" ] && compgen -G "$wheel_dir/llmcompressor*.whl" >/dev/null; then
+    return 0
+  fi
+  confirm_bootstrap_or_die "Spark1:wheel:llmcompressor"
+  mkdir -p "$wheel_dir"
+  docker run --rm -v "$wheel_dir:/wheels" "$VLLM_IMAGE" pip download -d /wheels llmcompressor datasets
+}
+
+run_local_quantization() {
+  local qdir="$1"
+  ensure_llmcompressor_wheels
+  mkdir -p "$qdir"
+  local tmp_py
+  tmp_py="$(mktemp)"
+  write_quantizer_script "$tmp_py"
+
+  local wheel_dir="$HF_CACHE_DIR/apertux-wheels"
+  local extra_mounts=(-v "$qdir:/quant_out" -v "$tmp_py:/tmp/quantize_apertus.py:ro")
+  local pre_install=""
+  if [ -d "$wheel_dir" ] && compgen -G "$wheel_dir/*.whl" >/dev/null; then
+    extra_mounts+=(-v "$wheel_dir:/wheels:ro")
+    pre_install="python3 -c 'import llmcompressor' >/dev/null 2>&1 || pip install --no-index --find-links=/wheels llmcompressor datasets; "
+  fi
+
+  local calib_args=""
+  if [ -n "$CALIB_FILE" ]; then
+    local abs_calib
+    abs_calib="$(cd "$(dirname "$CALIB_FILE")" && pwd)/$(basename "$CALIB_FILE")"
+    extra_mounts+=(-v "$abs_calib:/tmp/calib.jsonl:ro")
+    calib_args="--calib-file /tmp/calib.jsonl"
+  fi
+  local force_arg=""
+  [ "$FORCE_QUANT" = "1" ] && force_arg="--force"
+
+  docker run --rm \
+    --gpus all \
+    --ipc host \
+    -e APERTUX_RUN_QUANTIZER=1 \
+    -e HF_HUB_OFFLINE=1 \
+    -e TRANSFORMERS_OFFLINE=1 \
+    -e HF_HUB_DISABLE_TELEMETRY=1 \
+    -e DO_NOT_TRACK=1 \
+    -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
+    "${extra_mounts[@]}" \
+    --entrypoint bash \
+    "$VLLM_IMAGE" \
+    -lc "${pre_install}python3 /tmp/quantize_apertus.py --model '$MODEL' --output-dir /quant_out --scheme '$QUANT_SCHEME' --calib-samples '$CALIB_SAMPLES' $calib_args $force_arg"
+
+  rm -f "$tmp_py"
+}
+
+sync_quantized_to_worker() {
+  local qdir="$1"
+  local quant_slug="${MODEL//\//--}-${QUANT_SCHEME}"
+  if [ "$FORCE_QUANT" != "1" ]; then
+    local out q_ok
+    out="$(ssh "$WORKER_SSH" bash -s -- "$quant_slug" <<'REMOTE_EOF'
+set -euo pipefail
+# ROLE=check_quantized
+qbase="${QUANT_BASE_DIR:-$HOME/.cache/apertux/quantized}"
+rdir="${qbase%/}/$1"
+if [ -f "$rdir/apertux_quant_meta.json" ] && compgen -G "$rdir/*.safetensors" >/dev/null; then
+  printf 'QUANT_OK=1\n'
+else
+  printf 'QUANT_OK=0\n'
+fi
+REMOTE_EOF
+)"
+    q_ok="$(printf '%s\n' "$out" | awk -F= '/^QUANT_OK=/ { print $2; exit }')"
+    if [ "$q_ok" = "1" ]; then
+      return 0
+    fi
+  fi
+
+  tar -C "$qdir" -cf - . | ssh "$WORKER_SSH" "ROLE=sync_quantized; qbase=\${QUANT_BASE_DIR:-\$HOME/.cache/apertux/quantized}; rdir=\${qbase%/}/$quant_slug; mkdir -p \"\$rdir\" && tar -C \"\$rdir\" -xf -"
+}
+
+ensure_quantized_ready() {
+  [ "$QUANT_SCHEME" != "none" ] || return 0
+  local qdir
+  qdir="$(resolved_quant_dir)"
+  if [ "$FORCE_QUANT" = "1" ] || ! has_local_quantized_checkpoint "$qdir"; then
+    run_local_quantization "$qdir"
+  fi
+  if [ "$ROLE_MODE" = "cluster" ] && [ -n "$WORKER_SSH" ]; then
+    sync_quantized_to_worker "$qdir"
+  fi
 }
 
 wait_for_ray_cluster() {
@@ -986,6 +1219,44 @@ curl -sS http://${host_hint}:${API_PORT}/v1/chat/completions \\
 EOF
 }
 
+cmd_bench() {
+  local endpoint="${SMOKE_ENDPOINT:-http://127.0.0.1:${API_PORT}}"
+  endpoint="${endpoint%/}"
+  local payload t0 t1 resp stats
+  payload="$(printf '{"model":"%s","messages":[{"role":"user","content":"Write a clean Python implementation of merge sort with docstrings and complexity analysis."}],"max_tokens":%s,"temperature":0}' "$MODEL" "$BENCH_MAX_TOKENS")"
+  t0="$(python3 -c 'import time; print(f"{time.time():.6f}")')"
+  resp="$(curl -fsS "${endpoint}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload")" || die "Benchmark request failed against ${endpoint}/v1/chat/completions"
+  t1="$(python3 -c 'import time; print(f"{time.time():.6f}")')"
+  stats="$(python3 -c '
+import json, sys
+resp = json.loads(sys.argv[1])
+elapsed = max(float(sys.argv[3]) - float(sys.argv[2]), 1e-6)
+toks = int(resp.get("usage", {}).get("completion_tokens", 0))
+if toks <= 0:
+    content = resp["choices"][0]["message"]["content"]
+    toks = max(len(content.split()), 1)
+print(f"Benchmark: {toks} tokens in {elapsed:.2f}s ({toks / elapsed:.2f} tok/s)")
+' "$resp" "$t0" "$t1")"
+  printf '%s\n' "$stats"
+}
+
+cmd_quantize() {
+  [ "$QUANT_SCHEME" != "none" ] || QUANT_SCHEME="nvfp4"
+  check_host_preflight
+  if [ -z "$WORKER_SSH" ]; then
+    ROLE_MODE="head"
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    print_config
+    return 0
+  fi
+  ensure_artifacts_ready
+  ensure_quantized_ready
+  printf 'Quantized checkpoint ready (%s): %s\n' "$QUANT_SCHEME" "$(resolved_quant_dir)"
+}
+
 cmd_up() {
   check_host_preflight
   detect_local_fabric
@@ -998,6 +1269,7 @@ cmd_up() {
     return 0
   fi
   ensure_artifacts_ready
+  ensure_quantized_ready
 
   if [ "$ROLE_MODE" = "worker-only" ]; then
     start_local_worker
@@ -1018,13 +1290,19 @@ cmd_up() {
 
 main() {
   parse_args "$@"
-  if [ "$DRY_RUN" = "1" ] && [ "$ACTION" != "up" ]; then
+  if [ "$DRY_RUN" = "1" ] && [ "$ACTION" != "up" ] && [ "$ACTION" != "quantize" ]; then
     print_config
     exit 0
   fi
   case "$ACTION" in
     up)
       cmd_up
+      ;;
+    quantize)
+      cmd_quantize
+      ;;
+    bench)
+      cmd_bench
       ;;
     down)
       cmd_down
