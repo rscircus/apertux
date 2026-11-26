@@ -51,3 +51,10 @@ flowchart LR
 - Reference (flags, env vars, ports, memory math): [docs/reference/configuration.md](docs/reference/configuration.md)
 - Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
+
+## References
+
+- **Apertus (Swiss AI Initiative - ETH Zurich, EPFL, CSCS):** Open-weights multilingual and multimodal foundation models, documentation, and `APERTVS` visual identity - [apertus-ai.org](https://apertus-ai.org) and [huggingface.co/swiss-ai](https://huggingface.co/swiss-ai).
+- **Oleg Lavrovsky (`@loleg`):** Technical community stewardship, open sovereign AI outreach, and contributions across the Apertus documentation and runtime ecosystem at the EPFL AI Center / Swiss AI Initiative - [github.com/loleg](https://github.com/loleg) and [datalets.ch](https://datalets.ch).
+- **NVIDIA DGX Spark Playbooks:** Dual-Spark 200GbE ConnectX-7 networking and distributed multi-node Ray + NCCL reference workflows - [build.nvidia.com/spark](https://build.nvidia.com/spark).
+- **vLLM:** High-throughput tensor-parallel LLM serving engine and OpenAI-compatible HTTP server - [docs.vllm.ai](https://docs.vllm.ai).

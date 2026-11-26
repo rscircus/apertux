@@ -583,6 +583,9 @@ PY
   readme="$(cat "$ROOT_DIR/README.md")"
   assert_contains "$readme" "assets/logo-dark.svg" "README references dark logo variant"
   assert_contains "$readme" "assets/logo-light.svg" "README references light logo variant"
+  assert_contains "$readme" "## References" "README includes References section"
+  assert_contains "$readme" "https://apertus-ai.org" "README references Apertus project site"
+  assert_contains "$readme" "Oleg Lavrovsky" "README credits Oleg Lavrovsky"
 }
 
 test_help_and_defaults
