@@ -1,3 +1,7 @@
 .worktrees/
 .DS_Store
 *.log
+
+# Local-only: never tracked, never pushed, absent from every commit.
+/docs/superpowers/
+/AGENTS.md
