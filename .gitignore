@@ -1,6 +1,8 @@
 .worktrees/
 .DS_Store
 *.log
+__pycache__/
+*.pyc
 
 # Local-only: never tracked, never pushed, absent from every commit.
 /docs/superpowers/

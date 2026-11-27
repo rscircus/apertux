@@ -1,5 +1,9 @@
 # User Changelog
 
+## [2026.11.27.1335] - aeaab22
+
+- Added `--turbo` mode combining local `NVFP4` / `FP8_DYNAMIC` quantization with `Apertus-v1.1-1.5B-Instruct` or `ngram` speculative decoding (~20+ tok/s on 2x DGX Spark), plus `apertux.sh quantize` and `apertux.sh bench`.
+
 ## [2026.11.26.1404] - 5b6ee64
 
 - Added a References section to `README.md` linking Apertus, Oleg Lavrovsky (`@loleg`), NVIDIA DGX Spark Playbooks, and vLLM.
